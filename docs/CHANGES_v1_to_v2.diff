@@ -1,0 +1,2973 @@
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/app.py luna/buddy/app.py
+--- desk_buddy/buddy/app.py	2026-11-15 21:12:11.000000000 +0000
++++ luna/buddy/app.py	2026-11-18 20:33:57.488635802 +0000
+@@ -33,6 +33,12 @@
+ from .uiapps import (AboutScreen, BluetoothScreen, CaptureScreen, ChoiceScreen, DisplayScreen, MenuScreen, PersonScreen, PinScreen,
+                      PrivacyScreen, SecurityScreen, SettingsScreen, TelegramScreen, WifiScreen)
+ from .util import NetMonitor, mix, state_load, state_save, time_greeting
++from .vault import VaultManager, VaultScreen
++from .usbmon import USBMonitor, safe_eject
++from .textview import TextScreen
++from .calendar_mgr import CalendarScreen, CalendarService, CalendarStore
++from .control_center import ControlCenter, ControlCenterScreen
++from .telegram_bot import TelegramBot
+ 
+ log = logging.getLogger("app")
+ ROBOT, ANALYSIS_TIMED, EXITING, PHOTO, IMAGE_TIMED = "robot", "analysis_timed", "exiting", "photo", "image_timed"
+@@ -41,10 +47,10 @@
+                "photo": "photo", "show_image": "gallery", "gallery": "gallery", "close_gallery": "chat", "hidden_gallery": "hidden_gallery",
+                "change_pin": "hidden_gallery", "introduce": "introduce", "whoami": "chat", "who_visible": "chat", "list_people": "chat",
+                "music": "apps", "movie": "apps", "mctl": "apps", "album": "apps", "record": "photo", "security": "manage_people",
+-               "alarm": "manage_people", "back": "chat", "home": "chat", "comment": "chat", "pdf": "apps", "pdfctl": "apps", "usb": "gallery"}
++               "alarm": "manage_people", "back": "chat", "home": "chat", "comment": "chat", "pdf": "apps", "pdfctl": "apps", "usb": "gallery", "switch": "switches", "calendar": "calendar"}
+ OPEN_PERM = {"settings": "settings", "privacy": "settings", "about": "settings", "wifi": "settings", "bluetooth": "settings", "display": "settings",
+              "security": "settings", "gallery": "gallery", "camera": "photo", "music": "apps", "movies": "apps", "drawing": "apps",
+-             "analysis": "apps", "menu": "chat", "documents": "apps", "usb": "gallery"}
++             "analysis": "apps", "menu": "chat", "documents": "apps", "usb": "gallery", "calendar": "calendar", "control": "control_center"}
+ NEED_TEXT = {0: "my masters", 1: "my master and priority people", 2: "my master and priority people", 3: "people I know", 4: "everyone"}
+ 
+ 
+@@ -84,6 +90,8 @@
+         self.unknown_last_seen = 0.0
+         self.screens = {}
+         self.size = None
++        self.usb_present, self.usb_down = False, False
++        self._err_times = []
+ 
+         self.net = NetMonitor(force=True if simulate else None)
+         self.router = AudioRouter(cfg)
+@@ -107,7 +115,16 @@
+         self.display = DisplayControl(cfg, simulate)
+         self.sec = SecurityManager(cfg, self.net, simulate)
+         self.sec.siren.on_gap = self._siren_gap
++        self.vault = VaultManager(cfg, self.pins)
++        self.cal = CalendarStore(cfg, self.people)
++        self.cal_service = CalendarService(self)
++        self.ctrl = ControlCenter(cfg, simulate)
++        self.ctrl.post = lambda fn, arg: self.events.put(("call", (fn, arg)))
++        self.ctrl.on_found = lambda n: (self.toast("Found ESP32: %s" % n["name"], 4), self.say("I found a new switch node named %s." % n["name"], "surprised"))
++        self.tgbot = TelegramBot(self)
++        self.usbmon = USBMonitor(cfg, self.events, simulate)
+         self.brain = brainmod.Brain(cfg, self.sensors.snapshot, lambda: self.net.online, self.people.names)
++        self.brain.switch_names = self.ctrl.switch_names
+         st = state_load(cfg)
+         self.display.set(st.get("brightness", 100))
+         self.router.volume = st.get("volume", cfg.DEFAULT_VOLUME)
+@@ -140,7 +157,10 @@
+             th.start()
+         if not self.sim:
+             self.btkeeper.start()
+-        threading.Thread(target=self._usb_watch, daemon=True, name="usb").start()
++        self.usb_present = bool(F.usb_drives(cfg))
++        self.usbmon.start()
++        self.ctrl.start()
++        self.tgbot.start()
+         self.run_bg(self.wifi.active, lambda a: setattr(self, "wifi_status", a or "not connected"))
+         self.run_bg(lambda: [d["name"] for d in self.bt.devices() if d["connected"]],
+                     lambda l: setattr(self, "bt_status", ", ".join(l) if l else "not connected"))
+@@ -148,18 +168,22 @@
+         try:
+             while self.running:
+                 dt = clock.tick(cfg.FPS) / 1000.0
+-                self._handle_pygame_events()
+-                self._poll_events()
+-                self._tick(dt)
+-                self._draw()
+-                pygame.display.flip()
++                try:                                   # ONE bad frame / tap must never close Luna
++                    self._handle_pygame_events()
++                    self._poll_events()
++                    self._tick(dt)
++                    self._draw()
++                    pygame.display.flip()
++                except Exception:
++                    self._recover()
+         finally:
+             self._cleanup()
+ 
+     def _build_screens(self):
+         classes = [MenuScreen, SettingsScreen, ChoiceScreen, PinScreen, KeyboardScreen, ConfirmScreen, PrivacyScreen, PersonScreen, CaptureScreen,
+                    AboutScreen, WifiScreen, BluetoothScreen, DisplayScreen, SecurityScreen, TelegramScreen, GalleryApp, MoviesScreen, VideoPlayScreen,
+-                   MusicScreen, CameraAppScreen, DrawingGallery, DrawingCanvas, AnalysisApp, PdfScreen, FilesScreen]
++                   MusicScreen, CameraAppScreen, DrawingGallery, DrawingCanvas, AnalysisApp, PdfScreen, FilesScreen,
++                   VaultScreen, TextScreen, CalendarScreen, ControlCenterScreen]
+         for c in classes:
+             s = c(self)
+             self.screens[s.name] = s
+@@ -169,6 +193,9 @@
+         try:
+             self.speaker.clear()
+             self.sec.siren.stop()
++            self.usbmon.stop()
++            self.ctrl.stop()
++            self.tgbot.stop()
+             self.player.stop()
+             self.video.stop()
+             self.camera.stop_recording()
+@@ -290,6 +317,13 @@
+     # ============================================================ input
+     def _handle_pygame_events(self):
+         for ev in pygame.event.get():
++            try:
++                self._one_event(ev)
++            except Exception:
++                self._recover()
++
++    def _one_event(self, ev):
++        if True:
+             if ev.type == pygame.QUIT:
+                 self.running = False
+             elif ev.type == pygame.KEYDOWN:
+@@ -314,6 +348,10 @@
+         u = self.size[1] / 600.0
+         return pygame.Rect(int(self.size[0] / 2 - 38 * u), int(10 * u), int(76 * u), int(54 * u))
+ 
++    def usb_rect(self):
++        r = self.hamburger_rect()
++        return pygame.Rect(r.right + int(14 * self.size[1] / 600.0), r.top, r.width, r.height)
++
+     def _pointer(self, kind, pos):
+         if kind == "down":
+             self.finger_down = True
+@@ -328,6 +366,17 @@
+             getattr(scr, kind)(pos)
+             return
+         if self.state == ROBOT:
++            ur = self.usb_rect().inflate(30, 20)
++            if kind == "down" and self.usb_present and inside(pos, ur):
++                self.usb_down = True
++                return
++            if self.usb_down:
++                if kind == "up":
++                    self.usb_down = False
++                    if inside(pos, ur):
++                        self.mark_activity()
++                        self.open_app("usb")
++                return
+             hr = self.hamburger_rect().inflate(30, 20)
+             if kind == "down" and inside(pos, hr):
+                 self.menu_down = True
+@@ -517,6 +566,12 @@
+         if key in ("music", "movie"):
+             self._voice_play(act, r)
+             return
++        if key == "switch":
++            self._switch_action(act.split(":")[1], ":".join(act.split(":")[2:]))
++            return
++        if key == "calendar":
++            self._calendar_action(act.split(":")[1])
++            return
+         text = r.text
+         if person and not act and r.emotion != "confused" and person["name"] not in text and random.random() < 0.35 and text:
+             text = "%s, %s%s" % (person["name"], text[0].lower(), text[1:])
+@@ -619,10 +674,87 @@
+         else:
+             self.open(tag)
+ 
+-    def request_hidden(self):
++    def _recover(self):
++        """Called when ANY handler / frame raised. Log the traceback to logs/buddy.log and carry on."""
++        log.exception("recovered from an error - Luna keeps running")
++        now = time.time()
++        self._err_times = [t for t in self._err_times if now - t < 5.0] + [now]
++        self.finger_down = self.mini_active = self.menu_down = self.usb_down = False
++        try:
++            self.toast("Something went wrong - Luna recovered (see logs/buddy.log)", 3.5)
++            if len(self._err_times) >= 8:                  # an error storm: drop back to the robot face
++                self._err_times = []
++                self.go_robot(leave=False)
++        except Exception:
++            self.state, self.nav = ROBOT, []
++
++    # ---- hidden vault
++    def request_hidden(self, replace=False):
++        """Open the PIN / password modal; on success open data/hidden/ through VaultManager. Never exits the app."""
+         if not self.require("hidden_gallery"):
+             return
+-        self.require_pin("hidden", lambda: self.open("gallery", mode="hidden"))
++        self.vault.mount()
++        if self.vault.is_unlocked():
++            self.open("gallery", mode="hidden")
++            return
++        self.open("vault", mode="unlock" if self.vault.is_set() else "setup", on_done=self._vault_done)
++
++    def _vault_done(self, res):
++        if res in ("unlocked", "pin_set"):
++            self.vault.unlock()
++            self.open("gallery", mode="hidden")
++            return
++        self.toast({"cancel": "Vault closed", "failed": "Wrong password", "locked": "Vault is locked for a while"}.get(res, "Vault stayed locked"), 3)
++        g = self.screens["gallery"]
++        if self.state != "gallery" or g.mode == "hidden":      # graceful fallback: the normal gallery
++            self.open("gallery", mode="normal")
++
++    # ---- remote / voice helpers
++    def set_security(self, on, source=""):
++        self.sec.set_enabled(on)
++        self.toast("Security mode %s" % ("ON" if on else "OFF"), 3)
++        self.say("Guard mode %s%s." % ("on" if on else "off", (" from %s" % source) if source else ""), "alert" if on else "happy", 3)
++
++    def notify_text(self, text):
++        self.sec.notify_text(text)
++
++    def on_telegram_media(self, path):
++        self.toast("New media added to Gallery via Telegram", 4.5)
++        self.show("joy", 2.0)
++        g = self.screens.get("gallery")
++        if self.state == "gallery" and g is not None and g.mode == "normal" and not g.viewing:
++            g.reload()
++
++    def _switch_action(self, state, phrase):
++        cc, on = self.ctrl, state == "on"
++        if not cc.nodes:
++            self.say("I do not have a switch node yet. Open the Control Center and add an ESP32.", "confused")
++            return
++        tgt = cc.resolve_phrase(phrase)
++        if not tgt:
++            self.say("I could not find a switch called %s. You can rename a switch in the Control Center." % phrase, "confused")
++            return
++        node, sw = tgt
++        self.show("thinking", 2.5)
++
++        def done(ok, msg, n, s):
++            name = phrase if phrase in ("light", "lights", "lamp", "fan", "tv", "heater") else s["name"].lower()
++            if ok:
++                self.toast("%s - %s: %s" % (n["name"], s["name"], "ON" if on else "OFF"), 3.5)
++                self.say("Okay, the %s is %s." % (name, "on" if on else "off"), "joy" if on else "happy")
++            else:
++                self.say("Sorry, I could not reach the switch. Is the E S P 32 powered and on Wi-Fi?", "sad")
++                self.toast("Switch failed: %s" % msg, 4)
++            scr = self.screens.get("control")
++            if scr is not None and self.state == "control":
++                scr.reload()
++        cc.set_switch(node["id"], sw["servo"], on, done)
++
++    def _calendar_action(self, when):
++        if when == "upcoming":
++            self.say(self.cal.speak_upcoming(), "happy")
++        else:
++            self.say(self.cal.speak_day(when), "happy")
+ 
+     def open_security_photos(self):
+         self.open("gallery", mode="security")
+@@ -671,11 +803,14 @@
+     def usb_eject(self, path):
+         drive = next((d["path"] for d in F.usb_drives(self.cfg) if path and path.startswith(d["path"])), path)
+ 
+-        def done(ok):
+-            self.toast("You can remove the USB drive now" if ok else "Could not eject - is a file still open?", 4)
++        def done(res):
++            ok, msg = res if res else (False, "Eject failed")
++            self.toast(msg, 4)
+             if ok:
+                 self.screens["files"].drive_gone(drive)
+-        self.run_bg(lambda: F.eject(drive) if not self.sim else True, done)
++                self.usb_present = bool(F.usb_drives(self.cfg))
++        self.toast("Syncing and unmounting ...", 5)
++        self.run_bg(lambda: safe_eject(drive) if not self.sim else (True, "You can remove the USB drive now"), done)
+ 
+     def _usb_watch(self):
+         known = {d["path"]: d for d in F.usb_drives(self.cfg)}
+@@ -691,6 +826,7 @@
+             known = cur
+ 
+     def _usb_event(self, kind, val):
++        self.usb_present = True if kind == "in" else bool(F.usb_drives(self.cfg))
+         if kind == "in":
+             self.toast("USB drive connected: %s" % val["label"], 4)
+             if self.state not in (PHOTO, EXITING):
+@@ -963,6 +1099,13 @@
+     # ---- camera events / security
+     def _on_arrive(self, name):
+         now = time.time()
++        if self.state not in (PHOTO, "pin", "vault", EXITING) and not (self.asleep and not self.cfg.WAKE_ON_FACE):
++            try:
++                if self.cal_service.greet(name):          # birthday / anniversary wish - once per day per person
++                    self.last_greet[name] = now
++                    return
++            except Exception:
++                log.exception("birthday greeting failed")
+         if self.state in (PHOTO, "pin", EXITING) or now - self.last_greet.get(name, 0) < self.cfg.GREET_COOLDOWN_S:
+             return
+         if self.asleep and not self.cfg.WAKE_ON_FACE:
+@@ -1140,7 +1283,7 @@
+             scr.tick(dt)
+             self.last_activity = now
+             self.mini.update()
+-            limit = self.cfg.HIDDEN_IDLE_S if (self.state == "gallery" and scr.mode == "hidden") else 60 if self.state == "pin" else 420
++            limit = self.cfg.HIDDEN_IDLE_S if (self.state == "gallery" and scr.mode == "hidden") else 60 if self.state in ("pin", "vault") else 420
+             if self.state not in ("video", "capture", "canvas", "camera", "keyboard") and now - self.ui_last > limit:
+                 log.info("idle - back to robot mode")
+                 self.go_robot()
+@@ -1182,6 +1325,10 @@
+                 self.say(line, emo, 5)
+ 
+         self._security_tick(now)
++        self.cal_service.tick(now)
++        self.tgbot.gas_tick(snap, now)
++        if self.state == "video":
++            self.vault.touch()
+ 
+         idle = now - self.last_activity
+         if idle > self.cfg.SLEEP_AFTER_S and not snap["gas_alert"] and self.state == ROBOT and not self.sec.enabled:
+@@ -1276,6 +1423,11 @@
+         pygame.draw.rect(self.screen, (16, 26, 46), r, border_radius=int(14 * u))
+         pygame.draw.rect(self.screen, (70, 110, 170), r, width=2, border_radius=int(14 * u))
+         icon(self.screen, "menu", r.centerx, r.centery, 15 * u, (180, 205, 245))
++        if self.usb_present:                                   # lights up while a pen drive is plugged in
++            ur = self.usb_rect()
++            pygame.draw.rect(self.screen, (14, 46, 36), ur, border_radius=int(14 * u))
++            pygame.draw.rect(self.screen, (80, 225, 150), ur, width=3, border_radius=int(14 * u))
++            icon(self.screen, "usb", ur.centerx, ur.centery, 15 * u, (120, 255, 180))
+ 
+     def _draw_ripples(self):
+         now = time.time()
+@@ -1299,6 +1451,6 @@
+         net = "ONLINE" if self.net.online else "OFFLINE"
+         mic = "MIC" if getattr(self.listener, "available", False) else "NO MIC"
+         cam = "CAM" if self.camera.available else "NO CAM"
+-        txt = "%s  |  %s  |  %s  |  %s" % (net, self.router.label if not self.sim else "SIM audio", mic, cam)
++        txt = "%s  |  %s  |  %s  |  %s%s" % (net, self.router.label if not self.sim else "SIM audio", mic, cam, "  |  USB" if self.usb_present else "")
+         img = f.render(txt, True, mix(col, (120, 230, 160), 0.6) if self.net.online else col)
+         self.screen.blit(img, (w - img.get_width() - 18, 12))
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/brain.py luna/buddy/brain.py
+--- desk_buddy/buddy/brain.py	2026-11-15 21:11:40.000000000 +0000
++++ luna/buddy/brain.py	2026-11-18 20:32:56.209346699 +0000
+@@ -114,6 +114,7 @@
+         self.person = None
+         self.screen_ctx = ""
+         self.screen_comment = ""
++        self.switch_names = lambda: []        # set by the app: names of the ESP32 switches (for "turn on the fan")
+ 
+     # ------------------------------------------------------------ helpers
+     def summary(self):
+@@ -274,7 +275,40 @@
+             return Reply("Opening your documents.", "happy", "open:documents")
+         return None
+ 
++    # ------------------------------------------------------------ v2: ESP32 switches + calendar
++    SWITCH_WORDS = r"light|lights|lamp|lamps|bulb|tubelight|tube light|fan|switch|switches|heater|tv|television|plug|socket"
++
++    def _home(self, t, has):
++        verb = r"(?:turn|switch|put|power|flip)"
++        m = re.search(r"\b%s\s+(on|off)\s+(?:the |my |a |an )?(.+)$" % verb, t) or \
++            re.search(r"\b%s\s+(?:the |my |a |an )?(.+?)\s+(on|off)$" % verb, t)
++        if m:
++            a, b = m.group(1), m.group(2)
++            state, target = (a, b) if a in ("on", "off") else (b, a)
++            names = [n for n in self.switch_names() if n and not re.fullmatch(r"switch \d", n)]
++            hit = next((n for n in names if n in target), None)
++            if not hit:
++                w = re.search(r"\b(%s)\b" % self.SWITCH_WORDS, target)
++                hit = w.group(1) if w else None
++            if hit:
++                return Reply("", "happy", "switch:%s:%s" % (state, hit))
++        if has(r"\b(light|lights|lamp|fan)\b.*\b(on|off)\b", r"\b(on|off)\b.*\b(the )?(light|lights|lamp|fan)\b") and has(r"\b(please|can you|could you|luna)\b|^(turn|switch)"):
++            state = "off" if re.search(r"\boff\b", t) else "on"
++            w = re.search(r"\b(light|lights|lamp|fan)\b", t)
++            return Reply("", "happy", "switch:%s:%s" % (state, w.group(1)))
++        # calendar questions
++        if has(r"\b(calendar|events?|birthdays?|anniversar(?:y|ies)|reminders?|schedule)\b") and has(r"\b(what|any|do i have|tell me|read|check|is there)\b"):
++            if has(r"\btomorrow\b"):
++                return Reply("", "happy", "calendar:tomorrow")
++            if has(r"\btoday\b"):
++                return Reply("", "happy", "calendar:today")
++            return Reply("", "happy", "calendar:upcoming")
++        return None
++
+     def _apps(self, t, has):
++        r = self._home(t, has)
++        if r:
++            return r
+         r = self._docs_usb(t, has)
+         if r:
+             return r
+@@ -336,6 +370,8 @@
+                                      (r"\b(drawing|whiteboard|paint|sketch)\b", "drawing", "Opening drawing."), (r"\babout\b", "about", "Opening about."),
+                                      (r"\bwi-?fi\b", "wifi", "Opening Wi-Fi."), (r"\bbluetooth\b", "bluetooth", "Opening Bluetooth."),
+                                      (r"\bsecurity\b", "security", "Opening security."),
++                                     (r"\bcalendar\b", "calendar", "Opening the calendar."),
++                                     (r"\b(control cent(?:er|re)|switch ?board|smart home|home control)\b", "control", "Opening the control center."),
+                                      (r"\bprivacy\b", "privacy", "Opening privacy. Please type the PIN.")):
+                 if re.search(pat, what):
+                     return Reply(say, "happy", "open:" + target)
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/calendar_mgr.py luna/buddy/calendar_mgr.py
+--- desk_buddy/buddy/calendar_mgr.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/calendar_mgr.py	2026-11-18 20:30:20.128888618 +0000
+@@ -0,0 +1,500 @@
++"""Calendar: events (birthdays, anniversaries, custom), day-prior reminders at 09:00, face-recognition birthday wishes.
++
++data/calendar.json
++    {"events": [{"id": "a1b2c3d4", "kind": "birthday|anniversary|custom", "name": "Rahul", "title": "",
++                 "month": 11, "day": 19, "year": null, "yearly": true, "person": "Rahul"}]}
++
++* ``person`` links the event to a profile in data/priority/*.json (masters / priority / least priority).
++  The month/day is also mirrored into that profile ("birthday": "11-19") so the link is visible in the people files.
++* Reminder: every day from 09:00 Luna checks for events happening TOMORROW, plays a chime and announces
++  "Reminder: Tomorrow is Rahul's Birthday!".  If Luna was switched off at 09:00 she catches up until 21:00.
++* Greeting: when the camera recognises a person whose birthday / anniversary is TODAY, Luna shows joy / love and says
++  "Happy Birthday, Rahul! Wishing you an incredible year ahead!" - once per calendar day per person (kept on disk).
++"""
++import calendar as pycal
++import json
++import logging
++import math
++import os
++import struct
++import subprocess
++import threading
++import time
++import uuid
++import wave
++from datetime import date, datetime, timedelta
++
++import pygame
++
++from .face import font
++from .screens import AMBER, BG, BLUE, CARD, GREEN, MUTED, PURPLE, RED, TEXT, TRACK, button, icon_arrow, inside
++from .ui import Screen, icon
++from .util import guarded, mix
++
++log = logging.getLogger("calendar")
++KINDS = ("birthday", "anniversary", "custom")
++KIND_LABEL = {"birthday": "Birthday", "anniversary": "Anniversary", "custom": "Event"}
++KIND_COL = {"birthday": (255, 120, 170), "anniversary": AMBER, "custom": BLUE}
++
++
++def _atomic_write(path, data):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    tmp = path + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump(data, f, indent=1)
++    os.replace(tmp, path)
++
++
++# =============================================================================== store
++class CalendarStore:
++    def __init__(self, cfg, people=None):
++        self.cfg, self.people = cfg, people
++        self.lock = threading.RLock()
++        self.events = []
++        self.load()
++
++    def load(self):
++        with self.lock:
++            try:
++                with open(self.cfg.CALENDAR_FILE) as f:
++                    self.events = [e for e in json.load(f).get("events", []) if e.get("kind") in KINDS and e.get("month") and e.get("day")]
++            except FileNotFoundError:
++                self.events = []
++            except Exception as e:
++                log.warning("cannot read calendar.json: %s", e)
++                self.events = []
++
++    def save(self):
++        with self.lock:
++            _atomic_write(self.cfg.CALENDAR_FILE, {"events": self.events})
++
++    # ------------------------------------------------------------- editing
++    def add(self, kind, month, day, name="", title="", year=None, yearly=None, person=None):
++        if kind not in KINDS:
++            raise ValueError("bad kind")
++        try:
++            date(2024, int(month), int(day))             # leap year so 29 Feb is allowed
++        except ValueError:
++            raise ValueError("bad date")
++        if yearly is None:
++            yearly = kind != "custom" or year is None
++        if not yearly and not year:
++            year = date.today().year
++        person = person or self._guess_person(name)
++        ev = dict(id=uuid.uuid4().hex[:8], kind=kind, name=(name or "").strip()[:30], title=(title or "").strip()[:40],
++                  month=int(month), day=int(day), year=int(year) if year else None, yearly=bool(yearly), person=person)
++        with self.lock:
++            self.events.append(ev)
++            self.save()
++        self._mirror(ev)
++        return ev
++
++    def delete(self, event_id):
++        with self.lock:
++            ev = next((e for e in self.events if e["id"] == event_id), None)
++            if not ev:
++                return False
++            self.events.remove(ev)
++            self.save()
++        self._unmirror(ev)
++        return True
++
++    def _guess_person(self, name):
++        if not (self.people and name):
++            return None
++        p = self.people.get(name)
++        return p["name"] if p else None
++
++    # --- keep data/priority/*.json profile in sync ("link calendar entries directly to person profiles")
++    def _mirror(self, ev):
++        if not (self.people and ev.get("person") and ev["kind"] in ("birthday", "anniversary")):
++            return
++        try:
++            p = self.people.get(ev["person"])
++            if p is not None:
++                p[ev["kind"]] = "%02d-%02d" % (ev["month"], ev["day"])
++                self.people.save()
++        except Exception as e:
++            log.warning("profile link failed: %s", e)
++
++    def _unmirror(self, ev):
++        if not (self.people and ev.get("person") and ev["kind"] in ("birthday", "anniversary")):
++            return
++        try:
++            p = self.people.get(ev["person"])
++            if p is not None and p.get(ev["kind"]) == "%02d-%02d" % (ev["month"], ev["day"]):
++                p.pop(ev["kind"], None)
++                self.people.save()
++        except Exception as e:
++            log.warning("profile unlink failed: %s", e)
++
++    # ------------------------------------------------------------- queries
++    @staticmethod
++    def _matches(ev, d):
++        if ev["month"] == d.month and ev["day"] == d.day:
++            return ev.get("yearly") or ev.get("year") == d.year
++        # 29 Feb events are celebrated on 28 Feb in non-leap years
++        if ev["month"] == 2 and ev["day"] == 29 and not pycal.isleap(d.year) and d.month == 2 and d.day == 28:
++            return ev.get("yearly") or ev.get("year") == d.year
++        return False
++
++    def on(self, d):
++        with self.lock:
++            return [e for e in self.events if self._matches(e, d)]
++
++    def month_marks(self, year, month):
++        """{day: [kinds]} for the month grid."""
++        marks = {}
++        for day in range(1, pycal.monthrange(year, month)[1] + 1):
++            ks = [e["kind"] for e in self.on(date(year, month, day))]
++            if ks:
++                marks[day] = ks
++        return marks
++
++    def upcoming(self, days=30, start=None):
++        start = start or date.today()
++        out = []
++        for i in range(days + 1):
++            d = start + timedelta(days=i)
++            for e in self.on(d):
++                out.append((d, e))
++        return out
++
++    def for_person_today(self, name, today=None):
++        today = today or date.today()
++        n = (name or "").strip().lower()
++        res = []
++        for e in self.on(today):
++            if e["kind"] in ("birthday", "anniversary") and n and n in ((e.get("person") or "").lower(), (e.get("name") or "").lower()):
++                res.append(e)
++        return res
++
++    # ------------------------------------------------------------- wording
++    @staticmethod
++    def title_of(ev):
++        if ev["kind"] == "custom":
++            return ev.get("title") or ev.get("name") or "an event"
++        return "%s's %s" % (ev.get("name") or "someone", KIND_LABEL[ev["kind"]])
++
++    def reminder_text(self, ev):
++        return "Reminder: Tomorrow is %s!" % self.title_of(ev)
++
++    @staticmethod
++    def greeting_text(ev):
++        who = ev.get("person") or ev.get("name") or "friend"
++        if ev["kind"] == "birthday":
++            return "Happy Birthday, %s! Wishing you an incredible year ahead!" % who
++        if ev["kind"] == "anniversary":
++            return "Happy Anniversary, %s! Wishing you many more happy years together!" % who
++        return "Today is special, %s!" % who
++
++    def speak_day(self, when):
++        """Text for 'what is on my calendar today / tomorrow'."""
++        d = date.today() + timedelta(days=1 if when == "tomorrow" else 0)
++        evs = self.on(d)
++        if not evs:
++            return "You have nothing on the calendar %s." % when
++        return "%s: %s." % ("Tomorrow" if when == "tomorrow" else "Today", ", ".join(self.title_of(e) for e in evs))
++
++    def speak_upcoming(self):
++        ups = [(d, e) for d, e in self.upcoming(30) if d != date.today()][:3]
++        if not ups:
++            return "Nothing is coming up in the next thirty days."
++        return "Coming up: " + "; ".join("%s on %s" % (self.title_of(e), d.strftime("%d %B").lstrip("0")) for d, e in ups) + "."
++
++
++# =============================================================================== reminders + greetings
++class CalendarService:
++    """Runs inside the main loop (call .tick(now) every frame - it is cheap)."""
++
++    def __init__(self, app):
++        self.app = app
++        self.cfg = app.cfg
++        self.store = app.cal
++        self.st = self._load()
++        self._chime = None
++
++    # --- persistent once-a-day bookkeeping
++    def _load(self):
++        try:
++            with open(self.cfg.CALENDAR_STATE_FILE) as f:
++                d = json.load(f)
++        except Exception:
++            d = {}
++        d.setdefault("reminded", "")
++        d.setdefault("greeted", [])
++        return d
++
++    def _save(self):
++        try:
++            _atomic_write(self.cfg.CALENDAR_STATE_FILE, self.st)
++        except Exception as e:
++            log.warning("calendar state: %s", e)
++
++    # --- 09:00 reminder
++    def due_reminder(self, now_dt):
++        today = now_dt.date().isoformat()
++        if self.st["reminded"] == today:
++            return False
++        start = now_dt.replace(hour=self.cfg.CALENDAR_REMIND_HOUR, minute=self.cfg.CALENDAR_REMIND_MINUTE, second=0, microsecond=0)
++        return start <= now_dt < now_dt.replace(hour=self.cfg.CALENDAR_CATCHUP_UNTIL_HOUR, minute=0, second=0, microsecond=0)
++
++    def tick(self, now=None):
++        now_dt = datetime.fromtimestamp(now) if now else datetime.now()
++        if self.app.state in ("photo", "exiting") or not self.app.greeted:
++            return
++        if self.due_reminder(now_dt):
++            self.st["reminded"] = now_dt.date().isoformat()
++            self._save()
++            evs = self.store.on(now_dt.date() + timedelta(days=1))
++            if evs:
++                self.announce([self.store.reminder_text(e) for e in evs])
++
++    def announce(self, lines):
++        a = self.app
++        a.mark_activity()
++        for ln in lines:
++            a.notify_text(ln)
++
++        def go():
++            self._play_chime()
++            for ln in lines:
++                a.events.put(("say", (ln, "happy", len(ln) * 0.075 + 3)))
++        threading.Thread(target=go, daemon=True).start()
++
++    def _chime_path(self):
++        if self._chime:
++            return self._chime
++        p = os.path.join(self.cfg.DATA_DIR, "chime.wav")
++        if not os.path.exists(p):
++            os.makedirs(self.cfg.DATA_DIR, exist_ok=True)
++            rate = 22050
++            with wave.open(p, "wb") as w:
++                w.setnchannels(1)
++                w.setsampwidth(2)
++                w.setframerate(rate)
++                frames = bytearray()
++                for f0, dur in ((880.0, 0.22), (1175.0, 0.22), (1568.0, 0.45)):
++                    n = int(rate * dur)
++                    for i in range(n):
++                        env = min(1.0, i / 300.0) * math.exp(-3.0 * i / n)
++                        frames += struct.pack("<h", int(math.sin(2 * math.pi * f0 * i / rate) * 0.5 * 32000 * env))
++                w.writeframes(bytes(frames))
++        self._chime = p
++        return p
++
++    def _play_chime(self):
++        if self.app.sim:
++            log.info("*chime*")
++            return
++        try:
++            subprocess.run(["paplay", self._chime_path()], capture_output=True, timeout=10)
++        except Exception as e:
++            log.info("chime failed: %s", e)
++
++    # --- birthday greeting (called by App when the camera recognises somebody)
++    def greet(self, name):
++        """-> True when a celebration was started. Only once per calendar day per person."""
++        today = date.today()
++        todays = self.store.for_person_today(name, today)
++        done = False
++        for ev in todays:
++            key = "%s|%s|%s" % (today.isoformat(), (ev.get("person") or ev.get("name")).lower(), ev["kind"])
++            if key in self.st["greeted"]:
++                continue
++            self.st["greeted"].append(key)
++            self.st["greeted"] = [k for k in self.st["greeted"] if k.startswith(today.isoformat())][-50:]
++            self._save()
++            a = self.app
++            a.mark_activity()
++            a.say(self.store.greeting_text(ev), "joy" if ev["kind"] == "birthday" else "love", 9)
++            a.toast("Happy %s, %s!" % (KIND_LABEL[ev["kind"]], ev.get("person") or ev.get("name")), 6)
++            done = True
++        return done
++
++
++# =============================================================================== screen
++WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
++
++
++class CalendarScreen(Screen):
++    name, title, accent = "calendar", "Calendar", (255, 150, 100)
++    mini_pos = "br"
++
++    def enter(self, **kw):
++        t = date.today()
++        self.year, self.month, self.sel = t.year, t.month, t
++        self.press = None
++        self.msg = ""
++
++    def resume(self):
++        pass
++
++    # ---------------------------------------------------------------- geometry
++    def _grid(self):
++        u = self.u
++        return pygame.Rect(int(24 * u), int(150 * u), int(self.w * 0.60), int(self.h - 170 * u))
++
++    def _cells(self):
++        g = self._grid()
++        cw, ch = g.width / 7.0, g.height / 6.0
++        weeks = pycal.Calendar(firstweekday=0).monthdayscalendar(self.year, self.month)
++        out = []
++        for r, wk in enumerate(weeks):
++            for c, day in enumerate(wk):
++                if day:
++                    out.append((day, pygame.Rect(int(g.left + c * cw), int(g.top + r * ch), int(cw - 4), int(ch - 4))))
++        return out
++
++    def _nav(self):
++        u = self.u
++        return {"prev": pygame.Rect(int(24 * u), int(88 * u), int(56 * u), int(48 * u)),
++                "next": pygame.Rect(int(self.w * 0.60 - 32 * u), int(88 * u), int(56 * u), int(48 * u)),
++                "today": pygame.Rect(int(self.w * 0.60 + 50 * u), int(88 * u), int(110 * u), int(48 * u))}
++
++    def _panel(self):
++        u = self.u
++        x = self.w * 0.60 + 40 * u
++        return pygame.Rect(int(x), int(150 * u), int(self.w - x - 20 * u), int(self.h - 170 * u))
++
++    def _add_rect(self):
++        p = self._panel()
++        u = self.u
++        return pygame.Rect(p.left, int(p.top + 40 * u), p.width, int(54 * u))
++
++    def _ev_rows(self):
++        u, p = self.u, self._panel()
++        evs = self.app.cal.on(self.sel)
++        rows = []
++        for i, e in enumerate(evs[:5]):
++            r = pygame.Rect(p.left, int(p.top + 106 * u + i * 62 * u), p.width, int(54 * u))
++            rows.append((e, r, pygame.Rect(r.right - int(52 * u), r.top, int(52 * u), r.height)))
++        return rows
++
++    # ---------------------------------------------------------------- draw
++    @guarded("draw")
++    def draw(self, surf):
++        u = self.u
++        cal = self.app.cal
++        surf.fill(BG)
++        self.topbar(surf, "Calendar")
++        for n, r in self._nav().items():
++            button(surf, r, self.accent)
++            if n == "prev":
++                icon_arrow(surf, r.centerx, r.centery, 16 * u, TEXT, True)
++            elif n == "next":
++                icon_arrow(surf, r.centerx, r.centery, 16 * u, TEXT, False)
++            else:
++                self.text(surf, "Today", r.centerx, r.centery - 11 * u, 20, TEXT, center=True)
++        title = "%s %d" % (pycal.month_name[self.month], self.year)
++        self.text(surf, title, (self._nav()["prev"].right + self._nav()["next"].left) / 2, 94 * u, 30, TEXT, center=True)
++        g = self._grid()
++        cw = g.width / 7.0
++        for c, wd in enumerate(WEEKDAYS):
++            self.text(surf, wd, g.left + c * cw + cw / 2 - 2, 124 * u, 17, MUTED, center=True)
++        marks = cal.month_marks(self.year, self.month)
++        today = date.today()
++        for day, r in self._cells():
++            d = date(self.year, self.month, day)
++            col = self.accent if d == self.sel else (MUTED if d.weekday() >= 5 else TEXT)
++            pygame.draw.rect(surf, mix(CARD, self.accent, 0.35) if d == self.sel else CARD, r, border_radius=int(10 * u))
++            pygame.draw.rect(surf, GREEN if d == today else mix(CARD, MUTED, 0.3), r, width=3 if d == today else 1, border_radius=int(10 * u))
++            self.text(surf, str(day), r.left + 8 * u, r.top + 4 * u, 20, col)
++            for k, kind in enumerate(marks.get(day, [])[:3]):
++                pygame.draw.circle(surf, KIND_COL[kind], (int(r.left + 14 * u + k * 16 * u), int(r.bottom - 12 * u)), int(5 * u))
++        p = self._panel()
++        pygame.draw.rect(surf, mix(BG, self.accent, 0.08), p, border_radius=int(16 * u))
++        self.text(surf, self.sel.strftime("%a, %d %b %Y").replace(" 0", " "), p.left + 14 * u, p.top + 8 * u, 21, TEXT, maxw=p.width - 24 * u)
++        ar = self._add_rect()
++        button(surf, ar, GREEN)
++        icon(surf, "plus", ar.left + 34 * u, ar.centery, 14 * u, GREEN)
++        self.text(surf, "Add event", ar.left + 64 * u, ar.centery - 11 * u, 20, TEXT)
++        rows = self._ev_rows()
++        if not rows:
++            self.text(surf, "Nothing planned", p.centerx, p.top + 130 * u, 19, MUTED, False, center=True)
++        for e, r, tr in rows:
++            col = KIND_COL[e["kind"]]
++            pygame.draw.rect(surf, mix(CARD, col, 0.18), r, border_radius=int(12 * u))
++            pygame.draw.rect(surf, col, r, width=2, border_radius=int(12 * u))
++            self.text(surf, cal.title_of(e), r.left + 12 * u, r.top + 6 * u, 18, TEXT, maxw=r.width - 70 * u)
++            sub = KIND_LABEL[e["kind"]] + (" - linked to profile" if e.get("person") else "")
++            self.text(surf, sub, r.left + 12 * u, r.top + 30 * u, 14, MUTED, False, maxw=r.width - 70 * u)
++            from .screens import icon_trash
++            icon_trash(surf, tr.centerx, tr.centery, 16 * u, RED)
++
++    # ---------------------------------------------------------------- input
++    def on_down(self, pos):
++        self.press = pos
++
++    @guarded("on_up")
++    def on_up(self, pos):
++        if self.press is None:
++            return
++        self.press = None
++        for n, r in self._nav().items():
++            if inside(pos, r):
++                if n == "today":
++                    t = date.today()
++                    self.year, self.month, self.sel = t.year, t.month, t
++                else:
++                    m = self.month + (1 if n == "next" else -1)
++                    self.year += (m > 12) - (m < 1)
++                    self.month = (m - 1) % 12 + 1
++                    self.sel = date(self.year, self.month, min(self.sel.day, pycal.monthrange(self.year, self.month)[1]))
++                return
++        for day, r in self._cells():
++            if inside(pos, r):
++                self.sel = date(self.year, self.month, day)
++                return
++        if inside(pos, self._add_rect()):
++            self._add_flow()
++            return
++        for e, r, tr in self._ev_rows():
++            if inside(pos, tr):
++                self.app.confirm("Delete %s?" % self.app.cal.title_of(e), lambda eid=e["id"]: self._delete(eid), "Delete", danger=True)
++                return
++
++    def _delete(self, eid):
++        self.app.cal.delete(eid)
++        self.app.toast("Event deleted")
++
++    # ---------------------------------------------------------------- add-event flow
++    def _add_flow(self):
++        a = self.app
++        a.choose("What kind of event on %s?" % self.sel.strftime("%d %b"), [
++            ("Birthday", "Linked to a person Luna knows", lambda: self._pick_person("birthday"), (255, 120, 170)),
++            ("Anniversary", "Wedding, friendship ...", lambda: self._pick_person("anniversary"), AMBER),
++            ("Custom event", "Exam, trip, meeting ...", self._custom, BLUE)], self.accent)
++
++    def _pick_person(self, kind):
++        a = self.app
++        opts = [(n, "Luna knows this face", (lambda nm=n: self._save(kind, nm, nm)), GREEN) for n in a.people.names()[:12]]
++        opts.append(("Someone else...", "Type a name", lambda: a.ask_text("Name for the %s" % KIND_LABEL[kind].lower(), "", lambda t: self._save(kind, t, None) if t else None), BLUE))
++        a.choose("Whose %s?" % KIND_LABEL[kind].lower(), opts, KIND_COL[kind])
++
++    def _custom(self):
++        a = self.app
++
++        def got(t):
++            if not t:
++                return
++            a.choose("Repeat?", [("Every year", "Same day each year", lambda: self._save("custom", "", None, t, True), GREEN),
++                                 ("Only this day", "One time", lambda: self._save("custom", "", None, t, False), BLUE)], self.accent)
++        a.ask_text("Event title", "", got)
++
++    def _save(self, kind, name, person, title="", yearly=None):
++        a = self.app
++        try:
++            ev = a.cal.add(kind, self.sel.month, self.sel.day, name=name, title=title, year=self.sel.year if yearly is False else None,
++                           yearly=yearly, person=person)
++            a.toast("Saved: %s" % a.cal.title_of(ev), 3)
++        except Exception as e:
++            log.exception("calendar save")
++            a.toast("Could not save the event", 3)
++
++    def context(self):
++        evs = self.app.cal.on(self.sel)
++        return "The calendar showing %s %d. Selected day has %d event(s)." % (pycal.month_name[self.month], self.year, len(evs))
++
++    def comment(self):
++        return "Tap a day to see its events, or press Add event. I will remind you the day before."
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/commands_help.py luna/buddy/commands_help.py
+--- desk_buddy/buddy/commands_help.py	2026-11-15 21:11:40.000000000 +0000
++++ luna/buddy/commands_help.py	2026-11-18 20:32:38.399363131 +0000
+@@ -52,6 +52,15 @@
+         ("open documents / open USB", "Opens your PDF folder or the files on a plugged-in pen drive."),
+         ("backup to USB / eject USB", "Copies gallery photos, videos and drawings to the pen drive (masters) / safely removes it."),
+     ]),
++    ("Switches, calendar and alarm (v2)", [
++        ("turn on the light / switch", "Luna flicks the ESP32 servo switch ON, checks the reply and tells you."),
++        ("turn off the light / fan / lamp", "Same, OFF. Rename a switch in Control Center to give it a voice name."),
++        ("open control center", "Add / manage ESP32 nodes and toggle every switch."),
++        ("open calendar / what is on my calendar today / tomorrow", "Month view with birthdays, anniversaries and events."),
++        ("(automatic) 09:00 reminder", "Luna announces events that happen tomorrow, with a chime."),
++        ("(automatic) birthday wish", "When she recognises someone whose birthday is today she wishes them once per day."),
++        ("Telegram: /arm_alarm /disarm_alarm /alarm_status /room_status /snapshot", "Remote control from your phone."),
++    ]),
+     ("People and security", [
+         ("this is <name> / my name is <name>", "Luna learns the face and remembers it (new people start as least priority; the very first person becomes master)."),
+         ("no  (right after an introduction)", "Undo a wrongly heard name."),
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/control_center.py luna/buddy/control_center.py
+--- desk_buddy/buddy/control_center.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/control_center.py	2026-11-18 20:31:27.423087745 +0000
+@@ -0,0 +1,609 @@
++"""Hardware Control Center: ESP32 + MG90 servo switch nodes over the local Wi-Fi (REST).
++
++Pieces
++------
++Esp32Api        tiny HTTP client for the firmware  (GET /api/info, GET /api/status, POST /api/servo, POST /api/calibrate)
++ControlCenter   registry (data/esp32.json), background health poll + mDNS discovery, async switch dispatch, voice lookup
++ControlCenterScreen   the "Control Center" tile: Nodes tab (list / add / servo count) + Switchboard tab (toggles)
++
++Everything that touches the network runs in a worker thread; results come back to the UI thread through
++app.events (("call", (fn, arg))). A failed switch never raises into the main loop.
++"""
++import json
++import logging
++import os
++import re
++import socket
++import subprocess
++import threading
++import time
++
++import pygame
++
++from .face import font
++from .screens import AMBER, BG, BLUE, CARD, GREEN, MUTED, PURPLE, RED, TEXT, TRACK, button, inside
++from .ui import ListView, Screen, icon
++from .util import guarded, mix
++
++log = logging.getLogger("control")
++
++
++# =============================================================================== HTTP client for the firmware
++class Esp32Api:
++    def __init__(self, cfg, simulate=False):
++        self.cfg, self.sim = cfg, simulate
++        self._sim_state = {}
++
++    def _headers(self):
++        h = {"Content-Type": "application/json"}
++        if self.cfg.ESP32_API_KEY:
++            h["X-Luna-Key"] = self.cfg.ESP32_API_KEY
++        return h
++
++    @staticmethod
++    def resolve(host):
++        """Hostname / mDNS name / IP -> IPv4 string (or None)."""
++        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
++            return host
++        try:
++            return socket.getaddrinfo(host, 80, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
++        except OSError:
++            pass
++        if host.endswith(".local"):                                  # avahi fallback
++            try:
++                out = subprocess.run(["avahi-resolve", "-4", "-n", host], capture_output=True, text=True, timeout=4).stdout.split()
++                if len(out) >= 2:
++                    return out[1]
++            except Exception:
++                pass
++        return None
++
++    def base(self, node):
++        ip = self.resolve(node.get("host", "")) or node.get("ip")
++        return ("http://%s:%d" % (ip, int(node.get("port", 80))), ip) if ip else (None, None)
++
++    def info(self, node):
++        """-> dict or None."""
++        if self.sim:
++            return dict(name="sim-esp32", servos=4, ip="192.168.1.50")
++        import requests
++        base, ip = self.base(node)
++        if not base:
++            return None
++        try:
++            r = requests.get(base + "/api/info", headers=self._headers(), timeout=self.cfg.ESP32_TIMEOUT_S)
++            if r.status_code == 200:
++                d = r.json()
++                d["ip"] = ip
++                return d
++        except Exception as e:
++            log.debug("info %s: %s", node.get("host"), e)
++        return None
++
++    def status(self, node):
++        if self.sim:
++            return dict(ok=True, ip="192.168.1.50", rssi=-52, servos=[dict(id=i, state=self._sim_state.get((node["id"], i), "off")) for i in range(4)])
++        import requests
++        base, ip = self.base(node)
++        if not base:
++            return None
++        try:
++            r = requests.get(base + "/api/status", headers=self._headers(), timeout=self.cfg.ESP32_TIMEOUT_S)
++            if r.status_code == 200:
++                d = r.json()
++                d["ip"] = ip
++                return d
++        except Exception as e:
++            log.debug("status %s: %s", node.get("host"), e)
++        return None
++
++    def servo(self, node, servo_id, action, angle=None):
++        """POST /api/servo -> (ok, message). ok only when the ESP32 answers 200 OK with {"ok": true}."""
++        if self.sim:
++            self._sim_state[(node["id"], servo_id)] = action
++            time.sleep(0.2)
++            return True, "OK (simulated)"
++        import requests
++        base, ip = self.base(node)
++        if not base:
++            return False, "Cannot find %s on the network" % node.get("host")
++        body = {"servo_id": int(servo_id), "action": action}
++        if angle is not None:
++            body["angle"] = int(angle)
++        try:
++            r = requests.post(base + "/api/servo", data=json.dumps(body), headers=self._headers(), timeout=self.cfg.ESP32_TIMEOUT_S)
++        except requests.exceptions.Timeout:
++            return False, "The ESP32 did not answer in time"
++        except Exception as e:
++            return False, "No connection to the ESP32"
++        if r.status_code != 200:
++            return False, "ESP32 answered %d" % r.status_code
++        try:
++            return (bool(r.json().get("ok", True)), "OK")
++        except Exception:
++            return True, "OK"
++
++    def calibrate(self, node, servo_id, neutral):
++        if self.sim:
++            return True
++        import requests
++        base, _ = self.base(node)
++        try:
++            r = requests.post(base + "/api/calibrate", data=json.dumps({"servo_id": servo_id, "neutral": int(neutral)}), headers=self._headers(),
++                              timeout=self.cfg.ESP32_TIMEOUT_S)
++            return r.status_code == 200
++        except Exception:
++            return False
++
++
++# =============================================================================== manager
++GENERIC = {"light", "lights", "lamp", "switch", "switches", "bulb", "tube", "tubelight"}
++
++
++class ControlCenter:
++    def __init__(self, cfg, simulate=False):
++        self.cfg, self.sim = cfg, simulate
++        self.api = Esp32Api(cfg, simulate)
++        self.lock = threading.RLock()
++        self.nodes = []
++        self.net = {}                       # node_id -> dict(online, ip, last_seen, rssi)
++        self.busy = set()                   # (node_id, servo) currently moving
++        self.post = lambda fn, arg: fn(arg)  # replaced by the app (runs fn(arg) on the UI thread)
++        self.on_found = None                 # callback(node) when mDNS discovery adds a node
++        self.running = True
++        self._load()
++
++    # ---------------------------------------------------------- storage
++    def _load(self):
++        try:
++            with open(self.cfg.ESP32_FILE) as f:
++                self.nodes = json.load(f).get("nodes", [])
++        except FileNotFoundError:
++            self.nodes = []
++        except Exception as e:
++            log.warning("cannot read esp32.json: %s", e)
++            self.nodes = []
++        for n in self.nodes:
++            self._fix(n)
++
++    def save(self):
++        with self.lock:
++            os.makedirs(os.path.dirname(self.cfg.ESP32_FILE), exist_ok=True)
++            tmp = self.cfg.ESP32_FILE + ".tmp"
++            with open(tmp, "w") as f:
++                json.dump({"nodes": self.nodes}, f, indent=1)
++            os.replace(tmp, self.cfg.ESP32_FILE)
++
++    @staticmethod
++    def _fix(n):
++        n.setdefault("port", 80)
++        n["servos"] = max(1, min(4, int(n.get("servos", 1))))
++        sw = {s["servo"]: s for s in n.get("switches", [])}
++        n["switches"] = [sw.get(i, dict(servo=i, name="Switch %d" % (i + 1), state="off")) for i in range(n["servos"])]
++        return n
++
++    # ---------------------------------------------------------- nodes
++    def add_node(self, host, name=None, servos=1, auto=False):
++        host = host.strip().replace("http://", "").strip("/")
++        with self.lock:
++            for n in self.nodes:
++                if n["host"].lower() == host.lower():
++                    return n
++            nid = "n%d" % (max([int(n["id"][1:]) for n in self.nodes] + [0]) + 1)
++            n = self._fix(dict(id=nid, name=name or "ESP32 #%d" % (len(self.nodes) + 1), host=host, port=80, servos=servos, auto=auto))
++            self.nodes.append(n)
++            self.save()
++            return n
++
++    def remove_node(self, nid):
++        with self.lock:
++            self.nodes = [n for n in self.nodes if n["id"] != nid]
++            self.net.pop(nid, None)
++            self.save()
++
++    def node(self, nid):
++        return next((n for n in self.nodes if n["id"] == nid), None)
++
++    def set_servo_count(self, nid, count):
++        with self.lock:
++            n = self.node(nid)
++            if n:
++                n["servos"] = max(1, min(4, int(count)))
++                self._fix(n)
++                self.save()
++
++    def rename_node(self, nid, name):
++        n = self.node(nid)
++        if n and name.strip():
++            n["name"] = name.strip()[:24]
++            self.save()
++
++    def rename_switch(self, nid, servo, name):
++        n = self.node(nid)
++        if n and name.strip():
++            for s in n["switches"]:
++                if s["servo"] == servo:
++                    s["name"] = name.strip()[:24]
++            self.save()
++
++    def set_host(self, nid, host):
++        n = self.node(nid)
++        if n and host.strip():
++            n["host"] = host.strip().replace("http://", "").strip("/")
++            self.save()
++
++    # ---------------------------------------------------------- switchboard helpers
++    def all_switches(self):
++        """-> list of (node, switch, label) in screen order."""
++        out = []
++        for n in self.nodes:
++            for s in n["switches"]:
++                out.append((n, s, "%s - %s" % (n["name"], s["name"])))
++        return out
++
++    def online(self, nid):
++        return bool(self.net.get(nid, {}).get("online"))
++
++    def ip_of(self, n):
++        return self.net.get(n["id"], {}).get("ip") or n.get("ip") or n["host"]
++
++    def switch_names(self):
++        return [s["name"].lower() for _, s, _ in self.all_switches()]
++
++    def resolve_phrase(self, phrase):
++        """Voice: 'light', 'fan', 'lamp', 'switch', or a custom switch name -> (node, switch) or None."""
++        p = (phrase or "").lower().strip()
++        sw = self.all_switches()
++        if not sw:
++            return None
++        for n, s, _ in sw:
++            if p and (p in s["name"].lower() or s["name"].lower() in p):
++                return n, s
++        if p in GENERIC or not p:
++            return sw[0][0], sw[0][1]
++        return None
++
++    # ---------------------------------------------------------- dispatch (asynchronous)
++    def set_switch(self, nid, servo, on, cb=None):
++        """Flick the servo. cb(ok, message, node, switch) is called on the UI thread."""
++        n = self.node(nid)
++        if n is None:
++            if cb:
++                self.post(lambda _: cb(False, "Unknown node", None, None), None)
++            return
++        sw = next(s for s in n["switches"] if s["servo"] == servo)
++        key = (nid, servo)
++        if key in self.busy:
++            if cb:
++                self.post(lambda _: cb(False, "Still moving", n, sw), None)
++            return
++        self.busy.add(key)
++
++        def work():
++            ok, msg = False, "error"
++            try:
++                ok, msg = self.api.servo(n, servo, "on" if on else "off", self.cfg.ESP32_DEFAULT_ANGLE)
++            except Exception as e:
++                log.exception("switch failed")
++                msg = str(e)[:50]
++            finally:
++                self.busy.discard(key)
++            if ok:
++                sw["state"] = "on" if on else "off"
++                self.save()
++                self.net.setdefault(nid, {}).update(online=True, last_seen=time.time())
++            else:
++                self.net.setdefault(nid, {}).update(online=False)
++            self._log(n, sw, on, ok, msg)
++            if cb:
++                self.post(lambda _: cb(ok, msg, n, sw), None)
++        threading.Thread(target=work, daemon=True, name="switch").start()
++
++    def toggle(self, nid, servo, cb=None):
++        n = self.node(nid)
++        sw = next((s for s in n["switches"] if s["servo"] == servo), None) if n else None
++        self.set_switch(nid, servo, not (sw and sw["state"] == "on"), cb)
++
++    def _log(self, n, sw, on, ok, msg):
++        try:
++            os.makedirs(os.path.dirname(self.cfg.ESP32_LOG_FILE), exist_ok=True)
++            with open(self.cfg.ESP32_LOG_FILE, "a") as f:
++                f.write(json.dumps(dict(t=time.strftime("%Y-%m-%d %H:%M:%S"), node=n["name"], switch=sw["name"], action="on" if on else "off", ok=ok, msg=msg)) + "\n")
++        except Exception:
++            pass
++        log.info("switch %s/%s -> %s : %s (%s)", n["name"], sw["name"], "ON" if on else "OFF", "OK" if ok else "FAILED", msg)
++
++    # ---------------------------------------------------------- background health + discovery
++    def start(self):
++        threading.Thread(target=self._loop, daemon=True, name="control").start()
++
++    def stop(self):
++        self.running = False
++
++    def refresh_one(self, n):
++        d = self.api.status(n)
++        if d is None:
++            self.net.setdefault(n["id"], {}).update(online=False)
++            return False
++        self.net[n["id"]] = dict(online=True, ip=d.get("ip"), rssi=d.get("rssi"), last_seen=time.time())
++        for s in d.get("servos", []):
++            for sw in n["switches"]:
++                if sw["servo"] == s.get("id") and s.get("state") in ("on", "off"):
++                    sw["state"] = s["state"]
++        return True
++
++    def _loop(self):
++        last_disc = 0.0
++        while self.running:
++            try:
++                for n in list(self.nodes):
++                    self.refresh_one(n)
++                if time.time() - last_disc > 60:
++                    last_disc = time.time()
++                    self.discover()
++            except Exception:
++                log.exception("control loop")
++            for _ in range(int(self.cfg.ESP32_POLL_S * 5)):
++                if not self.running:
++                    return
++                time.sleep(0.2)
++
++    def discover(self):
++        """Find the default mDNS node (esp32-switch.local) - and any _luna-switch._tcp service when zeroconf is installed."""
++        found = []
++        host = self.cfg.ESP32_MDNS_NAME
++        if not any(n["host"].lower() == host.lower() for n in self.nodes):
++            if self.api.resolve(host):
++                d = self.api.info(dict(id="tmp", host=host, port=80))
++                if d:
++                    found.append((host, d))
++        try:
++            from zeroconf import ServiceBrowser, Zeroconf
++
++            class L:
++                def __init__(s):
++                    s.items = []
++
++                def add_service(s, zc, t, name):
++                    info = zc.get_service_info(t, name)
++                    if info and info.parsed_addresses():
++                        s.items.append(info.parsed_addresses()[0])
++
++                def update_service(s, *a):
++                    pass
++
++                def remove_service(s, *a):
++                    pass
++            zc, lis = Zeroconf(), L()
++            ServiceBrowser(zc, "_luna-switch._tcp.local.", lis)
++            time.sleep(2.0)
++            zc.close()
++            for ip in lis.items:
++                if not any(n["host"] == ip or n.get("ip") == ip for n in self.nodes):
++                    d = self.api.info(dict(id="tmp", host=ip, port=80))
++                    if d:
++                        found.append((ip, d))
++        except Exception:
++            pass
++        for host, d in found:
++            n = self.add_node(host, servos=int(d.get("servos", 1)), auto=True)
++            n["ip"] = d.get("ip")
++            self.save()
++            log.info("discovered ESP32 node %s (%s)", n["name"], host)
++            if self.on_found:
++                self.post(self.on_found, n)
++        return [h for h, _ in found]
++
++
++# =============================================================================== screen
++class ControlCenterScreen(Screen):
++    name, title, accent = "control", "Control Center", (80, 210, 190)
++    mini_pos = "br"
++
++    def enter(self, tab="nodes", **kw):
++        self.tab = tab
++        self.lv = ListView(self.u)
++        self.pending = set()
++        self.msg, self.msg_until = "", 0.0
++        self.reload()
++
++    def resume(self):
++        self.reload()
++
++    # ---------------------------------------------------------------- rows
++    def reload(self):
++        cc = self.app.ctrl
++        rows = []
++        if self.tab == "nodes":
++            for n in cc.nodes:
++                on = cc.online(n["id"])
++                rows.append(dict(label=n["name"], sub="%s   -   %d servo%s" % (cc.ip_of(n), n["servos"], "" if n["servos"] == 1 else "s"), icon="wifi",
++                                 right="ONLINE" if on else "OFFLINE", rcol=GREEN if on else RED, tag=("node", n["id"]), col=self.accent))
++            if not rows:
++                rows.append(dict(label="No ESP32 paired yet", sub="Press + Add ESP32 (IP address or esp32-switch.local)", icon="wifi", tag=("none", None), col=MUTED))
++        else:
++            for n, s, label in cc.all_switches():
++                on = cc.online(n["id"])
++                rows.append(dict(label=label, sub="Servo %d   -   %s" % (s["servo"], "online" if on else "OFFLINE"), tag=("sw", n["id"], s["servo"]),
++                                 col=GREEN if s["state"] == "on" else self.accent))
++            if not rows:
++                rows.append(dict(label="No switches yet", sub="Add an ESP32 on the Nodes tab", tag=("none", None), col=MUTED))
++        self.lv.set_rows(rows, keep=True)
++
++    def tick(self, dt):
++        if int(time.time() * 2) % 4 == 0:
++            self.reload()
++
++    # ---------------------------------------------------------------- geometry
++    def _tabs(self):
++        u = self.u
++        return {"nodes": pygame.Rect(int(30 * u), int(90 * u), int(220 * u), int(52 * u)),
++                "board": pygame.Rect(int(262 * u), int(90 * u), int(240 * u), int(52 * u))}
++
++    def _list_rect(self):
++        u = self.u
++        return pygame.Rect(int(30 * u), int(156 * u), int(self.w - 60 * u), int(self.h - 156 * u - 100 * u))
++
++    def _add_rect(self):
++        u = self.u
++        return pygame.Rect(int(30 * u), int(self.h - 84 * u), int(300 * u), int(62 * u))
++
++    # ---------------------------------------------------------------- draw
++    @guarded("draw")
++    def draw(self, surf):
++        u = self.u
++        surf.fill(BG)
++        self.topbar(surf, "Control Center", right="%d node(s)" % len(self.app.ctrl.nodes))
++        for k, r in self._tabs().items():
++            act = (k == "nodes") == (self.tab == "nodes")
++            button(surf, r, self.accent if act else MUTED, mix(CARD, self.accent, 0.35) if act else None)
++            self.text(surf, "Nodes" if k == "nodes" else "Switchboard", r.centerx, r.centery - 11 * u, 21, TEXT, center=True)
++        lr = self._list_rect()
++        self.lv.draw(surf, lr, self.accent)
++        if self.tab == "board":
++            self._draw_pills(surf, lr)
++        if self.tab == "nodes":
++            ar = self._add_rect()
++            button(surf, ar, GREEN)
++            icon(surf, "plus", ar.left + 40 * u, ar.centery, 15 * u, GREEN)
++            self.text(surf, "Add ESP32", ar.left + 76 * u, ar.centery - 12 * u, 22, TEXT)
++        if time.time() < self.msg_until:
++            self.text(surf, self.msg, self.w / 2 - 120 * u, self.h - 62 * u, 19, AMBER, center=True)
++
++    def _draw_pills(self, surf, lr):
++        u, lv = self.u, self.lv
++        sw = self.app.ctrl.all_switches()
++        for i, (n, s, _) in enumerate(sw):
++            y = lr.top + i * lv.row_h - lv.scroll
++            cell = pygame.Rect(lr.left, int(y), lr.width, int(lv.row_h - 8 * u))
++            if cell.top < lr.top - 4 or cell.bottom > lr.bottom + 4:
++                continue
++            on = s["state"] == "on"
++            busy = (n["id"], s["servo"]) in self.pending
++            pill = pygame.Rect(cell.right - int(130 * u), cell.centery - int(20 * u), int(100 * u), int(40 * u))
++            pygame.draw.rect(surf, mix(TRACK, GREEN, 0.7) if on else TRACK, pill, border_radius=int(20 * u))
++            kx = pill.right - 20 * u if on else pill.left + 20 * u
++            pygame.draw.circle(surf, AMBER if busy else TEXT, (int(kx), pill.centery), int(16 * u))
++            lab = "..." if busy else ("ON" if on else "OFF")
++            t = font(16 * u).render(lab, True, TEXT)
++            surf.blit(t, (pill.left - t.get_width() - 12 * u, pill.centery - t.get_height() / 2))
++
++    # ---------------------------------------------------------------- input
++    def on_down(self, pos):
++        self.lv.down(pos)
++        self._down_pos = pos
++
++    def on_move(self, pos):
++        self.lv.move(pos)
++
++    @guarded("on_up")
++    def on_up(self, pos):
++        for k, r in self._tabs().items():
++            if inside(pos, r) and inside(getattr(self, "_down_pos", pos), r):
++                self.lv.down_pos = None
++                self.tab = k
++                self.lv.scroll = 0
++                self.reload()
++                return
++        if self.tab == "nodes" and inside(pos, self._add_rect()):
++            self.lv.down_pos = None
++            self.add_flow()
++            return
++        tag = self.lv.up(pos)
++        if not tag or tag[0] == "none":
++            return
++        long = getattr(self.lv, "last_hold", 0) > 0.7
++        if tag[0] == "node":
++            self.node_menu(tag[1])
++        elif tag[0] == "sw":
++            if long:
++                self.switch_menu(tag[1], tag[2])
++            else:
++                self.toggle(tag[1], tag[2])
++
++    # ---------------------------------------------------------------- actions
++    def say_msg(self, text, secs=3.5):
++        self.msg, self.msg_until = text, time.time() + secs
++
++    def toggle(self, nid, servo):
++        a = self.app
++        if (nid, servo) in self.pending:
++            return
++        self.pending.add((nid, servo))
++
++        def done(ok, msg, n, sw):
++            self.pending.discard((nid, servo))
++            self.reload()
++            if ok:
++                self.say_msg("%s - %s: %s" % (n["name"], sw["name"], sw["state"].upper()))
++            else:
++                self.say_msg("Could not switch: %s" % msg)
++        a.ctrl.toggle(nid, servo, done)
++
++    def add_flow(self):
++        a = self.app
++
++        def got_host(host):
++            if not host or not host.strip():
++                return
++
++            def got_name(name):
++                n = a.ctrl.add_node(host, name=(name or "").strip() or None)
++                self.say_msg("Checking %s ..." % n["name"])
++
++                def work():
++                    d = a.ctrl.api.info(n)
++                    return d
++
++                def done(d):
++                    if d:
++                        a.ctrl.set_servo_count(n["id"], int(d.get("servos", n["servos"])))
++                        a.ctrl.refresh_one(n)
++                        self.say_msg("%s is online (%d servos)" % (n["name"], n["servos"]))
++                    else:
++                        self.say_msg("Saved, but %s did not answer yet" % n["name"], 5)
++                    self.reload()
++                a.run_bg(work, done)
++                self.reload()
++            a.ask_text("Name for this ESP32", "ESP32 #%d" % (len(a.ctrl.nodes) + 1), got_name, hint="for example: Bedroom switches")
++        a.ask_text("ESP32 address", a.cfg.ESP32_MDNS_NAME, got_host, hint="IP address (192.168.1.50) or esp32-switch.local")
++
++    def node_menu(self, nid):
++        a, cc = self.app, self.app.ctrl
++        n = cc.node(nid)
++        if not n:
++            return
++
++        def count():
++            a.choose("How many MG90 servos on %s?" % n["name"], [("%d servo%s" % (k, "" if k == 1 else "s"), "", (lambda kk=k: self._set_count(nid, kk)), self.accent) for k in (1, 2, 3, 4)], self.accent)
++
++        def test():
++            self.say_msg("Testing ...")
++            a.run_bg(lambda: cc.refresh_one(n), lambda ok: (self.say_msg("Online" if ok else "No answer from %s" % cc.ip_of(n)), self.reload()))
++
++        a.choose(n["name"], [
++            ("Test connection", cc.ip_of(n), test, GREEN),
++            ("Servos connected: %d" % n["servos"], "Choose 1 to 4", count, BLUE),
++            ("Rename", "", lambda: a.ask_text("New name", n["name"], lambda t: (cc.rename_node(nid, t), self.reload()) if t else None), AMBER),
++            ("Change address", n["host"], lambda: a.ask_text("ESP32 address", n["host"], lambda t: (cc.set_host(nid, t), self.reload()) if t else None), AMBER),
++            ("Remove this ESP32", "", lambda: a.confirm("Remove %s?" % n["name"], lambda: (cc.remove_node(nid), self.reload()), "Remove", danger=True), RED)], self.accent)
++
++    def _set_count(self, nid, k):
++        self.app.ctrl.set_servo_count(nid, k)
++        self.reload()
++        self.say_msg("Servos set to %d" % k)
++
++    def switch_menu(self, nid, servo):
++        a, cc = self.app, self.app.ctrl
++        n = cc.node(nid)
++        s = next(x for x in n["switches"] if x["servo"] == servo)
++        a.choose("%s - %s" % (n["name"], s["name"]), [
++            ("Rename switch", "e.g. Light, Fan, Lamp - Luna uses the name by voice",
++             lambda: a.ask_text("Switch name", s["name"], lambda t: (cc.rename_switch(nid, servo, t), self.reload()) if t else None), AMBER),
++            ("Toggle now", "", lambda: self.toggle(nid, servo), GREEN)], self.accent)
++
++    def context(self):
++        return "The Control Center on the %s tab, with %d ESP32 node(s)." % ("switchboard" if self.tab == "board" else "nodes", len(self.app.ctrl.nodes))
++
++    def comment(self):
++        return "Tap a switch to flick it, or say, Luna, turn on the light."
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/fileapps.py luna/buddy/fileapps.py
+--- desk_buddy/buddy/fileapps.py	2026-11-15 21:16:45.000000000 +0000
++++ luna/buddy/fileapps.py	2026-11-18 20:32:22.349264065 +0000
+@@ -341,9 +341,9 @@
+         else:
+             self.entries = F.list_dir(self.cur)
+             for i, (n, fp, k, size) in enumerate(self.entries):
+-                col = {"folder": AMBER, "pdf": RED_PDF, "image": BLUE, "audio": (255, 120, 170), "video": (255, 160, 70)}.get(k, MUTED)
++                col = {"folder": AMBER, "pdf": RED_PDF, "image": BLUE, "audio": (255, 120, 170), "video": (255, 160, 70), "text": (150, 215, 255)}.get(k, MUTED)
+                 sub = "%d item%s" % (size, "" if size == 1 else "s") if k == "folder" else F.human(size)
+-                rows.append(dict(label=n, sub=sub, icon={"folder": "folder", "pdf": "pdf", "image": "gallery", "audio": "music", "video": "film"}.get(k, "file"), tag=("entry", i), col=col))
++                rows.append(dict(label=n, sub=sub, icon={"folder": "folder", "pdf": "pdf", "image": "gallery", "audio": "music", "video": "film", "text": "file"}.get(k, "file"), tag=("entry", i), col=col))
+             if not rows:
+                 rows.append(dict(label="This folder is empty", sub="Copy PDFs into data/pdfs/ or open a USB drive" if self.mode == "docs" else "", icon="folder", tag=("none", None), col=MUTED))
+             base = self.root or self.cur
+@@ -410,7 +410,7 @@
+         a = self.app
+         opts = [("Open", os.path.basename(fp), lambda: self._open(next(i for i, e in enumerate(self.entries) if e[1] == fp)), GREEN)]
+         if self.mode == "usb":
+-            opts.append(("Copy to Luna", "Keep a copy on the robot", lambda: a.run_bg(lambda: F.copy_to_luna(a.cfg, fp), lambda m: a.toast(m or "Copy failed", 3)), BLUE))
++            opts.append(("Copy to Luna" if k != "image" else "Copy to Gallery", "Keep a copy on the robot", lambda: a.run_bg(lambda: F.copy_to_luna(a.cfg, fp), lambda m: a.toast(m or "Copy failed", 3)), BLUE))
+         a.choose(os.path.basename(fp)[:40], opts, self.accent)
+ 
+     def _open(self, i):
+@@ -421,6 +421,8 @@
+             self.refresh()
+         elif k == "pdf":
+             a.open("pdf", path=fp)
++        elif k == "text":
++            a.open("textview", path=fp)
+         elif k == "image":
+             imgs = [e[1] for e in self.entries if e[2] == "image"]
+             a.open("gallery", mode="list", files=imgs, index=imgs.index(fp))
+@@ -440,3 +442,8 @@
+ 
+     def comment(self):
+         return "Tap a PDF to read it, or hold a file to copy it to my memory." if self.mode == "usb" else "These are your documents. Tap a PDF and I can read it out loud for you."
++
++
++from .util import harden as _harden          # noqa: E402
++_harden(FilesScreen, ("enter", "refresh", "on_down", "on_move", "on_up", "_open", "_options", "on_back"))
++_harden(PdfScreen, ("enter", "on_down", "on_move", "on_up", "tick"))
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/files.py luna/buddy/files.py
+--- desk_buddy/buddy/files.py	2026-11-15 16:51:03.000000000 +0000
++++ luna/buddy/files.py	2026-11-18 20:32:04.078541137 +0000
+@@ -18,6 +18,8 @@
+         return "folder"
+     if p.endswith(".pdf"):
+         return "pdf"
++    if p.endswith((".txt", ".md")):
++        return "text"
+     if p.endswith(IMAGE_EXTS):
+         return "image"
+     if p.endswith(AUDIO_EXTS):
+@@ -36,6 +38,15 @@
+ 
+ def usb_drives(cfg):
+     """-> list of dict(label, path, free, total) for every mounted pen drive."""
++    from . import usbmon
++    try:
++        return list(usbmon.scan(cfg).values())
++    except Exception as e:
++        log.info("usb scan failed: %s", e)
++        return []
++
++
++def _usb_drives_old(cfg):
+     out, seen = [], set()
+     for pat in cfg.USB_ROOTS:
+         for p in sorted(glob.glob(pat)):
+@@ -86,11 +97,11 @@
+ def copy_to_luna(cfg, src):
+     """Copy a file from a USB drive into the right Luna folder. Returns a message."""
+     k = kind_of(src)
+-    dest = {"pdf": cfg.PDF_DIR, "audio": os.path.join(cfg.MUSIC_DIR, "Imported"), "video": cfg.MOVIES_DIR, "image": cfg.GALLERY_DIR}.get(k)
++    dest = {"pdf": cfg.PDF_DIR, "audio": os.path.join(cfg.MUSIC_DIR, "Imported"), "video": cfg.MOVIES_DIR, "image": cfg.GALLERY_DIR, "text": cfg.PDF_DIR}.get(k)
+     if not dest:
+         return "Luna cannot store this file type"
+     copy_into(src, dest)
+-    return "Copied to Luna (%s)" % {"pdf": "Documents", "audio": "Music / Imported", "video": "Movies", "image": "Gallery"}[k]
++    return "Copied to Luna (%s)" % {"pdf": "Documents", "audio": "Music / Imported", "video": "Movies", "image": "Gallery", "text": "Documents"}[k]
+ 
+ 
+ def backup_to_usb(cfg, drive_path):
+@@ -114,22 +125,9 @@
+ 
+ 
+ def eject(path):
+-    """Unmount (and power off) a pen drive safely. Returns True on success."""
+-    try:
+-        os.sync()
+-    except Exception:
+-        pass
+-    try:
+-        src = subprocess.run(["findmnt", "-n", "-o", "SOURCE", path], capture_output=True, text=True, timeout=5).stdout.strip()
+-        if src:
+-            r = subprocess.run(["udisksctl", "unmount", "-b", src], capture_output=True, text=True, timeout=20)
+-            if r.returncode == 0:
+-                subprocess.run(["udisksctl", "power-off", "-b", src.rstrip("0123456789")], capture_output=True, timeout=10)
+-                return True
+-        return subprocess.run(["umount", path], capture_output=True, timeout=20).returncode == 0
+-    except Exception as e:
+-        log.info("eject failed: %s", e)
+-        return False
++    """Flush + unmount + power off. Returns (ok, message)."""
++    from . import usbmon
++    return usbmon.safe_eject(path)
+ 
+ 
+ def find_pdf(cfg, query):
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/media.py luna/buddy/media.py
+--- desk_buddy/buddy/media.py	2026-11-15 21:11:40.000000000 +0000
++++ luna/buddy/media.py	2026-11-18 20:32:04.078134175 +0000
+@@ -108,7 +108,7 @@
+         try:
+             if os.path.exists(self.sock_path):
+                 os.remove(self.sock_path)
+-            self.proc = subprocess.Popen([self.cfg.MPV, "--fullscreen", "--osc=yes", "--hwdec=auto", "--really-quiet",
++            self.proc = subprocess.Popen([self.cfg.MPV, "--fullscreen", "--osc=yes", "--hwdec=%s" % getattr(self.cfg, "MPV_HWDEC", "auto"), *getattr(self.cfg, "MPV_EXTRA", []), "--really-quiet",
+                                           "--no-input-default-bindings", "--input-conf=" + self.conf_file(),
+                                           "--input-ipc-server=" + self.sock_path, path],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/mediaapps.py luna/buddy/mediaapps.py
+--- desk_buddy/buddy/mediaapps.py	2026-11-15 21:11:40.000000000 +0000
++++ luna/buddy/mediaapps.py	2026-11-18 20:33:57.488970984 +0000
+@@ -34,6 +34,9 @@
+ 
+     def enter(self, mode="normal", select=0, cb=None, files=None, index=None, **kw):
+         self.mode, self.cb, self.viewing = mode, cb, False
++        if mode == "hidden" and not self.app.vault.is_unlocked():     # the vault is only reachable through VaultManager
++            mode = self.mode = "normal"
++            self.app.toast("The hidden gallery is locked")
+         self.list_files = files
+         self.title = {"normal": "Gallery", "hidden": "Hidden Gallery", "security": "Security photos", "pick": "Choose photos", "list": "Pictures"}[mode]
+         self.reload()
+@@ -49,8 +52,25 @@
+         elif self.mode == "pick":
+             files = [p for p in a.store.list(False) if not is_video(p)]
+             self.g.open(files, False, "Choose photos", GREEN, getattr(self, "limit", 10), False)
++        elif self.mode == "hidden":
++            if a.vault.is_unlocked():
++                self.g.open(a.vault.list_files(), True)
++            else:                                              # session ended -> normal gallery, never the OS
++                self.mode, self.title = "normal", "Gallery"
++                self.g.open(a.store.list(False), False)
+         else:
+-            self.g.open(a.store.list(self.mode == "hidden"), self.mode == "hidden")
++            self.g.open(a.store.list(False), False)
++
++    def leave(self):
++        if self.mode == "hidden":
++            self.app.vault.lock()
++
++    def tick(self, dt):
++        if self.mode == "hidden":
++            if not self.app.vault.is_unlocked():                 # session expired -> back to the normal gallery
++                self.mode, self.title, self.viewing = "normal", "Gallery", False
++                self.reload()
++                self.app.toast("Hidden gallery locked")
+ 
+     def set_pick(self, limit, cb):
+         self.mode, self.limit, self.cb, self.viewing = "pick", limit, cb, False
+@@ -71,11 +91,9 @@
+             button(surf, r, TEXT)
+             icon_arrow(surf, r.centerx, r.centery, 18 * self.u, TEXT, True)
+ 
+-    def tick(self, dt):
+-        pass
+-
+     # --- input
+     def down(self, pos):
++        self.app.vault.touch()
+         if self.viewing:
+             self.vdown = pos
+             return
+@@ -106,6 +124,7 @@
+         kind, val = ev
+         if kind == "lock":
+             if self.hidden:
++                self.app.vault.lock()
+                 self.mode = "normal"
+                 self.title = "Gallery"
+                 self.reload()
+@@ -135,7 +154,7 @@
+         if is_video(path):
+             self.app.play_video(path)
+             return
+-        self.v.open(path, controls=True, hidden=self.hidden, index=idx, count=len(files), allow_hide=self.mode in ("normal", "hidden"))
++        self.v.open(path, controls=True, hidden=self.hidden, index=idx, count=len(files), allow_hide=self.mode in ("normal", "hidden"), allow_copy=self.mode == "list")
+         self.viewing = True
+ 
+     def _viewer_action(self, act):
+@@ -147,6 +166,9 @@
+             self.reload()
+         elif act in ("prev", "next"):
+             self._open(idx + (1 if act == "next" else -1))
++        elif act == "copy":
++            src = self.v.path
++            a.run_bg(lambda: __import__("buddy.files", fromlist=["x"]).copy_into(src, a.cfg.GALLERY_DIR), lambda r: a.toast("Copied to Gallery" if r else "Copy failed", 3))
+         elif act == "delete" and self.mode == "list":
+             a.toast("Files from a USB drive are read-only here")
+         elif act == "delete":
+@@ -893,3 +915,7 @@
+ 
+     def comment(self):
+         return self.app.brain.summary()
++
++
++from .util import harden as _harden          # noqa: E402  - error boundary for every click handler of the gallery
++_harden(GalleryApp, ("enter", "reload", "down", "move", "up", "_open", "_viewer_action", "on_back", "draw"))
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/screens.py luna/buddy/screens.py
+--- desk_buddy/buddy/screens.py	2026-11-15 11:14:13.000000000 +0000
++++ luna/buddy/screens.py	2026-11-18 20:32:22.348251413 +0000
+@@ -232,8 +232,9 @@
+         self.confirm_until = 0.0
+         self.paused = False
+ 
+-    def open(self, path, timed=False, seconds=10.0, controls=False, hidden=False, index=0, count=1, allow_hide=True):
++    def open(self, path, timed=False, seconds=10.0, controls=False, hidden=False, index=0, count=1, allow_hide=True, allow_copy=False):
+         self.allow_hide = allow_hide
++        self.allow_copy = allow_copy
+         self.path, self.timed, self.left, self.total = path, timed, seconds, seconds
+         self.controls, self.hidden, self.index, self.count = controls, hidden, index, count
+         self.img = load_image(path)
+@@ -251,10 +252,15 @@
+     def _buttons(self):
+         u, w, h = self.u, self.w, self.h
+         bw, bh, gap = 110 * u, 64 * u, 18 * u
+-        names = ["prev", "next", "hide", "delete", "close"]
++        names = ["prev", "next", "copy", "close"] if getattr(self, "allow_copy", False) else ["prev", "next", "hide", "delete", "close"]
+         total = len(names) * bw + (len(names) - 1) * gap
+         x0, y = 24 * u, h - bh - 14 * u
+-        return {n: pygame.Rect(int(x0 + i * (bw + gap)), int(y), int(bw), int(bh)) for i, n in enumerate(names)}
++        out, x = {}, x0
++        for n in names:
++            wd = bw * (2.4 if n == "copy" else 1.0)
++            out[n] = pygame.Rect(int(x), int(y), int(wd), int(bh))
++            x += wd + gap
++        return out
+ 
+     def draw(self, surf):
+         u, w, h = self.u, self.w, self.h
+@@ -286,7 +292,7 @@
+             b = self._buttons()
+             s = 22 * u
+             for n, r in b.items():
+-                col = {"hide": PURPLE, "delete": RED, "close": TEXT}.get(n, BLUE)
++                col = {"hide": PURPLE, "delete": RED, "close": TEXT, "copy": GREEN}.get(n, BLUE)
+                 if n == "hide" and not getattr(self, "allow_hide", True):
+                     col = MUTED
+                 if n == "delete" and time.time() < self.confirm_until:
+@@ -302,11 +308,15 @@
+                     icon_lock(surf, cx, cy - 2 * u, s * 0.8, col, open_=self.hidden)
+                 elif n == "delete":
+                     icon_trash(surf, cx, cy, s * 0.8, col)
++                elif n == "copy":
++                    t2 = font(20 * u).render("Copy to Gallery", True, col)
++                    surf.blit(t2, (cx - t2.get_width() / 2, cy - t2.get_height() / 2))
+                 else:
+                     icon_x(surf, cx, cy, s, col)
+-            t = font(16 * u).render("Unhide" if self.hidden else "Hide", True, MUTED)
+-            surf.blit(t, (b["hide"].centerx - t.get_width() / 2, b["hide"].top - 22 * u))
+-            if time.time() < self.confirm_until:
++            if "hide" in b:
++                t = font(16 * u).render("Unhide" if self.hidden else "Hide", True, MUTED)
++                surf.blit(t, (b["hide"].centerx - t.get_width() / 2, b["hide"].top - 22 * u))
++            if "delete" in b and time.time() < self.confirm_until:
+                 t = font(16 * u).render("Tap again to delete", True, RED)
+                 surf.blit(t, (b["delete"].centerx - t.get_width() / 2, b["delete"].top - 22 * u))
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/security.py luna/buddy/security.py
+--- desk_buddy/buddy/security.py	2026-11-15 00:32:53.000000000 +0000
++++ luna/buddy/security.py	2026-11-18 20:32:04.077899443 +0000
+@@ -183,7 +183,8 @@
+ 
+     def record(self, path, label, kind):
+         """Log a security photo; send it to Telegram now (online) or later (queued)."""
+-        entry = dict(file=os.path.basename(path), name=label, kind=kind, time=time.strftime("%Y-%m-%d %H:%M:%S"), sent=False)
++        entry = dict(file=os.path.basename(path), name=label, kind=kind, time=time.strftime("%Y-%m-%d %H:%M:%S"), sent=False,
++                     siren="ON" if self.siren.active else "off")
+         with self._lock:
+             with open(self.log_path, "a") as f:
+                 f.write(json.dumps(entry) + "\n")
+@@ -212,7 +213,8 @@
+                 if not os.path.exists(p):
+                     e["sent"] = True
+                     continue
+-                cap = "%s: %s at %s" % ("Unknown person" if e["kind"] == "unknown" else "Visitor", e["name"] or "Unknown", e["time"])
++                cap = "\U0001F6A8 %s: %s\nDate: %s\nTime: %s\nSiren: %s" % ("INTRUSION - unknown person" if e["kind"] == "unknown" else "Visitor", e["name"] or "Unknown",
++                                                                  e["time"][:10], e["time"][11:], e.get("siren", "off"))
+                 ok, _ = self.telegram.send_photo(p, cap)
+                 if ok:
+                     e["sent"] = True
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/telegram_bot.py luna/buddy/telegram_bot.py
+--- desk_buddy/buddy/telegram_bot.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/telegram_bot.py	2026-11-18 20:31:55.587089419 +0000
+@@ -0,0 +1,238 @@
++"""Bidirectional Telegram bot for Luna (direct HTTPS long-polling with `requests` - no extra library).
++
++Uses the BOT_TOKEN / CHAT_ID you already typed in Settings > Security > Telegram alerts (data/telegram.json).
++ONLY messages from that chat id are obeyed - everybody else is silently ignored (and logged).
++
++Receives
++    photo / video / image or video document   -> saved to data/gallery/ + toast "New media added to Gallery via Telegram"
++    /arm_alarm  /disarm_alarm  /alarm_status   -> guard mode on / off / report
++    /room_status                               -> temperature, humidity (DHT22), air quality (MQ-2), pressure (BMP280)
++    /snapshot                                  -> webcam picture sent back to you
++    /help
++Sends
++    gas / smoke alert (rate limited, repeated every GAS_ALERT_REPEAT_S while it lasts, plus an all-clear)
++    intrusion snapshot with date, time and siren status (done by security.py - see caption there)
++"""
++import logging
++import os
++import re
++import threading
++import time
++
++log = logging.getLogger("tgbot")
++
++HELP = ("Luna commands:\n/arm_alarm - guard mode ON\n/disarm_alarm - back to pet mode\n/alarm_status - guard + siren state\n"
++        "/room_status - temperature, humidity, air quality, pressure\n/snapshot - live webcam picture\n"
++        "Send me a photo or video and I will put it in Luna's gallery.")
++
++
++class TelegramBot(threading.Thread):
++    def __init__(self, app):
++        super().__init__(daemon=True, name="tgbot")
++        self.app = app
++        self.cfg = app.cfg
++        self.running = True
++        self.offset = 0
++        self.gas_active = False
++        self.gas_last = 0.0
++        self._cmds_set = False
++        self.sent = []                              # (kind, text) - for the simulator / tests
++
++    # ----------------------------------------------------------------- plumbing
++    @property
++    def tg(self):
++        return self.app.sec.telegram
++
++    def ready(self):
++        return self.cfg.TELEGRAM_BOT_ENABLED and self.tg.configured() and (self.app.net.online or self.app.sim)
++
++    def _api(self, method, data=None, files=None, timeout=15):
++        import requests
++        r = requests.post("https://api.telegram.org/bot%s/%s" % (self.tg.token, method), data=data, files=files, timeout=timeout)
++        return r
++
++    def say(self, text):
++        """Send a text to the configured chat (never raises)."""
++        self.sent.append(("text", text))
++        if self.app.sim or not self.tg.configured():
++            return False
++        try:
++            return self._api("sendMessage", {"chat_id": self.tg.chat_id, "text": text}).ok
++        except Exception as e:
++            log.info("send failed: %s", e)
++            return False
++
++    def send_photo(self, path, caption):
++        self.sent.append(("photo", caption))
++        if self.app.sim or not self.tg.configured():
++            return False
++        try:
++            with open(path, "rb") as f:
++                return self._api("sendPhoto", {"chat_id": self.tg.chat_id, "caption": caption}, {"photo": f}, 30).ok
++        except Exception as e:
++            log.info("photo failed: %s", e)
++            return False
++
++    def stop(self):
++        self.running = False
++
++    # ----------------------------------------------------------------- main loop
++    def run(self):
++        backoff = 3
++        while self.running:
++            if not self.ready() or self.app.sim:
++                time.sleep(4)
++                continue
++            try:
++                if not self._cmds_set:
++                    self._set_commands()
++                self.poll_once()
++                backoff = 3
++            except Exception as e:
++                log.info("telegram poll error: %s", e)
++                time.sleep(backoff)
++                backoff = min(60, backoff * 2)
++
++    def _set_commands(self):
++        import json
++        cmds = [("arm_alarm", "Guard mode ON"), ("disarm_alarm", "Guard mode OFF"), ("alarm_status", "Alarm status"),
++                ("room_status", "Temperature, humidity, air"), ("snapshot", "Webcam picture"), ("help", "List commands")]
++        self._api("setMyCommands", {"commands": json.dumps([{"command": c, "description": d} for c, d in cmds])})
++        self._cmds_set = True
++
++    def poll_once(self):
++        r = self._api("getUpdates", {"offset": self.offset, "timeout": self.cfg.TELEGRAM_POLL_TIMEOUT_S, "allowed_updates": '["message"]'},
++                      timeout=self.cfg.TELEGRAM_POLL_TIMEOUT_S + 10)
++        if not r.ok:
++            raise RuntimeError("getUpdates %s" % r.status_code)
++        for upd in r.json().get("result", []):
++            self.offset = upd["update_id"] + 1
++            try:
++                self.handle(upd.get("message") or {})
++            except Exception:
++                log.exception("telegram update failed")
++
++    # ----------------------------------------------------------------- one incoming message
++    def handle(self, msg):
++        if not msg:
++            return
++        chat = str(msg.get("chat", {}).get("id", ""))
++        if chat != str(self.tg.chat_id):
++            log.warning("telegram: ignored message from unauthorised chat %s", chat)
++            return
++        text = (msg.get("text") or "").strip()
++        if text.startswith("/"):
++            self.command(text)
++            return
++        media = self._media_of(msg)
++        if media:
++            self.download_media(*media)
++
++    def command(self, text):
++        cmd = re.match(r"/(\w+)", text).group(1).lower()
++        a = self.app
++        if cmd in ("start", "help"):
++            self.say(HELP)
++        elif cmd == "arm_alarm":
++            a.events.put(("call", (lambda _: a.set_security(True, "Telegram"), None)))
++            self.say("Guard mode ARMED. Luna is watching the room.")
++        elif cmd == "disarm_alarm":
++            a.events.put(("call", (lambda _: a.set_security(False, "Telegram"), None)))
++            self.say("Guard mode DISARMED. Luna is back in pet mode.")
++        elif cmd == "alarm_status":
++            self.say(self.alarm_status())
++        elif cmd == "room_status":
++            self.say(self.room_status())
++        elif cmd == "snapshot":
++            threading.Thread(target=self._snapshot, daemon=True).start()
++        else:
++            self.say("Unknown command. Send /help")
++
++    # ----------------------------------------------------------------- reports
++    def alarm_status(self):
++        s = self.app.sec
++        return "Alarm: %s\nSiren: %s\nIntruder photos waiting to upload: %d\nTime: %s" % (
++            "ARMED (guard mode)" if s.enabled else "DISARMED (pet mode)", "SOUNDING" if s.siren.active else "off", s.pending(), time.strftime("%Y-%m-%d %H:%M:%S"))
++
++    def room_status(self):
++        d = self.app.sensors.snapshot()
++        f = lambda v, fmt: (fmt % v) if v is not None else "--"
++        src = d.get("pressure_src") or ("BMP280" if d.get("has_bmp") else "online")
++        gas = ("Gas level %d%%" % d["aq_pct"]) if d.get("has_analog") else ("GAS DETECTED" if d.get("gas_alert") else "no gas detected")
++        return ("Room status (%s)\nTemperature: %s C\nHumidity: %s %% (DHT22)\nAir quality: %s (MQ-2, %s)\nPressure: %s hPa (%s)\nComfort: %s"
++                % (time.strftime("%H:%M:%S"), f(d["temperature"], "%.1f"), f(d["humidity"], "%.0f"), d["aq_label"], gas, f(d["pressure"], "%.0f"), src, d.get("comfort", "--")))
++
++    def _snapshot(self):
++        path = os.path.join(self.cfg.DATA_DIR, "tg_snapshot.jpg")
++        if self.app.camera.capture_jpeg(path, time.strftime("%Y-%m-%d  %H:%M:%S")):
++            self.send_photo(path, "Snapshot %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
++        else:
++            self.say("Sorry, the webcam did not give me a picture.")
++
++    # ----------------------------------------------------------------- incident alerts
++    def gas_tick(self, snap, now=None):
++        """Call every frame from the main loop; cheap. Sends the alert + repeats + all-clear."""
++        now = now or time.time()
++        if snap.get("gas_alert"):
++            if not self.gas_active or now - self.gas_last >= self.cfg.GAS_ALERT_REPEAT_S:
++                first = not self.gas_active
++                self.gas_active, self.gas_last = True, now
++                lvl = ("Gas level: %d%%\n" % snap["aq_pct"]) if snap.get("has_analog") else ""
++                txt = ("\u26a0\ufe0f ALERT: Gas/Smoke detected!\n%sAir quality: %s\nTemperature: %s C   Humidity: %s %%\nTime: %s%s"
++                       % (lvl, snap.get("aq_label"), "%.1f" % snap["temperature"] if snap.get("temperature") is not None else "--",
++                          "%.0f" % snap["humidity"] if snap.get("humidity") is not None else "--", time.strftime("%Y-%m-%d %H:%M:%S"),
++                          "" if first else "\n(still detected)"))
++                threading.Thread(target=self.say, args=(txt,), daemon=True).start()
++        elif self.gas_active:
++            self.gas_active = False
++            threading.Thread(target=self.say, args=("\u2705 Air is clear again (%s)." % time.strftime("%H:%M:%S"),), daemon=True).start()
++
++    # ----------------------------------------------------------------- media ingest
++    @staticmethod
++    def _media_of(msg):
++        """-> (kind, file_id, ext, size) or None."""
++        if msg.get("photo"):
++            p = max(msg["photo"], key=lambda x: x.get("file_size", 0) or x.get("width", 0))
++            return "photo", p["file_id"], ".jpg", p.get("file_size", 0)
++        for key in ("video", "video_note", "animation"):
++            if msg.get(key):
++                v = msg[key]
++                return "video", v["file_id"], ".mp4", v.get("file_size", 0)
++        d = msg.get("document")
++        if d:
++            mime = (d.get("mime_type") or "").lower()
++            name = (d.get("file_name") or "").lower()
++            ext = os.path.splitext(name)[1] or (".jpg" if "jpeg" in mime else ".png" if "png" in mime else ".mp4" if "mp4" in mime else "")
++            if mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp"):
++                return "photo", d["file_id"], ext if ext in (".jpg", ".jpeg", ".png", ".webp") else ".jpg", d.get("file_size", 0)
++            if mime.startswith("video/") or ext in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
++                return "video", d["file_id"], ext if ext in (".mp4", ".mkv", ".avi", ".mov", ".webm") else ".mp4", d.get("file_size", 0)
++        return None
++
++    def download_media(self, kind, file_id, ext, size):
++        import requests
++        if size and size > self.cfg.TELEGRAM_MAX_FILE_MB * 1024 * 1024:
++            self.say("That file is bigger than %d MB - Telegram bots cannot download it. Please send a smaller one." % self.cfg.TELEGRAM_MAX_FILE_MB)
++            return None
++        r = self._api("getFile", {"file_id": file_id})
++        if not r.ok:
++            self.say("Telegram would not let me download that file.")
++            return None
++        fpath = r.json()["result"]["file_path"]
++        os.makedirs(self.cfg.GALLERY_DIR, exist_ok=True)
++        base = "TG_%s" % time.strftime("%Y%m%d_%H%M%S")
++        dest, n = os.path.join(self.cfg.GALLERY_DIR, base + ext), 1
++        while os.path.exists(dest):
++            dest = os.path.join(self.cfg.GALLERY_DIR, "%s_%d%s" % (base, n, ext))
++            n += 1
++        part = dest + ".part"
++        with requests.get("https://api.telegram.org/file/bot%s/%s" % (self.tg.token, fpath), stream=True, timeout=60) as dl:
++            dl.raise_for_status()
++            with open(part, "wb") as f:
++                for chunk in dl.iter_content(65536):
++                    f.write(chunk)
++        os.replace(part, dest)                         # the gallery never sees half-written files
++        log.info("telegram media saved: %s", dest)
++        self.app.events.put(("call", (self.app.on_telegram_media, dest)))
++        self.say("\u2705 Saved to Luna's gallery.")
++        return dest
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/textview.py luna/buddy/textview.py
+--- desk_buddy/buddy/textview.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/textview.py	2026-11-18 20:29:30.683033557 +0000
+@@ -0,0 +1,191 @@
++"""Text / Markdown viewer with read-aloud (for .txt and .md files, e.g. from a USB drive)."""
++import logging
++import os
++import re
++
++import pygame
++
++from .face import font
++from .fileapps import speech_chunks
++from .screens import AMBER, BG, CARD, GREEN, MUTED, TEXT, button, inside
++from .ui import Screen, icon
++from .util import clamp, guarded, mix
++
++log = logging.getLogger("textview")
++MAX_BYTES = 2_000_000
++
++
++def md_to_lines(raw):
++    """Very small Markdown clean-up for display: (text, style) with style in h1/h2/h3/body/code."""
++    out, in_code = [], False
++    for ln in raw.splitlines():
++        if ln.strip().startswith("```"):
++            in_code = not in_code
++            continue
++        if in_code:
++            out.append((ln, "code"))
++            continue
++        m = re.match(r"^(#{1,3})\s+(.*)$", ln)
++        if m:
++            out.append((m.group(2).strip(), "h%d" % len(m.group(1))))
++            continue
++        ln = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", ln)
++        ln = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", ln)
++        ln = re.sub(r"(\*\*|__|\*|_|`)", "", ln)
++        ln = re.sub(r"^\s*[-*+]\s+", "\u2022 ", ln)
++        out.append((ln, "body"))
++    return out
++
++
++class TextScreen(Screen):
++    name, title, accent = "textview", "Text", (110, 200, 255)
++    mini_pos = "tr"
++
++    def enter(self, path="", **kw):
++        self.path = path
++        self.title = os.path.basename(path)[:40]
++        self.scale = 1.0
++        self.scroll, self.drag, self.moved = 0.0, None, 0.0
++        self.reading, self.chunks = False, []
++        try:
++            with open(path, "r", encoding="utf-8", errors="replace") as f:
++                raw = f.read(MAX_BYTES)
++        except OSError as e:
++            raw = "Cannot open this file: %s" % e
++        self.is_md = path.lower().endswith(".md")
++        self.raw = raw
++        self.src = md_to_lines(raw) if self.is_md else [(l, "body") for l in raw.splitlines()]
++        self._wrap_cache = None
++
++    def leave(self):
++        self.stop_reading()
++
++    # ---------------------------------------------------------------- layout
++    def _wrapped(self):
++        key = (round(self.scale, 2), self.w)
++        if self._wrap_cache and self._wrap_cache[0] == key:
++            return self._wrap_cache[1]
++        u, maxw = self.u, self.w - 80 * self.u
++        lines = []
++        for text, style in self.src:
++            size = {"h1": 34, "h2": 30, "h3": 26, "code": 20}.get(style, 24) * self.scale
++            f = font(size * u, style.startswith("h"))
++            words, cur = text.split(" "), ""
++            if not text.strip():
++                lines.append(("", style, size))
++                continue
++            for wd in words:
++                t = (cur + " " + wd).strip() if cur else wd
++                if f.render(t, True, TEXT).get_width() > maxw and cur:
++                    lines.append((cur, style, size))
++                    cur = wd
++                else:
++                    cur = t
++            lines.append((cur, style, size))
++        self._wrap_cache = (key, lines)
++        return lines
++
++    def _height(self):
++        return sum(s * 1.35 * self.u for _, _, s in self._wrapped()) + 40 * self.u
++
++    def _view(self):
++        u = self.u
++        return pygame.Rect(0, int(78 * u), self.w, int(self.h - 78 * u - 84 * u))
++
++    def _bar(self):
++        u = self.u
++        y = self.h - 76 * u
++        out, x = {}, 30 * u
++        for n, s in (("smaller", 64), ("bigger", 64), ("top", 110), ("read", 170)):
++            out[n] = pygame.Rect(int(x), int(y), int(s * u), int(64 * u))
++            x += s * u + 14 * u
++        return out
++
++    @guarded("draw")
++    def draw(self, surf):
++        u = self.u
++        surf.fill((22, 26, 36))
++        v = self._view()
++        self.scroll = clamp(self.scroll, 0, max(0.0, self._height() - v.height))
++        y = v.top + 14 * u - self.scroll
++        for text, style, size in self._wrapped():
++            h = size * 1.35 * u
++            if y + h >= v.top and y <= v.bottom and text:
++                col = {"h1": (130, 200, 255), "h2": (150, 215, 255), "h3": (170, 225, 255), "code": (160, 230, 170)}.get(style, TEXT)
++                img = font(size * u, style.startswith("h")).render(text, True, col)
++                surf.blit(img, (40 * u, y))
++            y += h
++        self.topbar(surf, self.title)
++        pygame.draw.rect(surf, mix(BG, self.accent, 0.12), pygame.Rect(0, int(self.h - 84 * u), self.w, int(84 * u)))
++        pygame.draw.line(surf, self.accent, (0, int(self.h - 84 * u)), (self.w, int(self.h - 84 * u)), 2)
++        for n, r in self._bar().items():
++            on = n == "read" and self.reading
++            button(surf, r, GREEN if on else MUTED, mix(CARD, GREEN, 0.4) if on else None)
++            if n in ("smaller", "bigger"):
++                self.text(surf, "A-" if n == "smaller" else "A+", r.centerx, r.centery - 12 * u, 22, TEXT, center=True)
++            elif n == "top":
++                self.text(surf, "Top", r.centerx, r.centery - 12 * u, 20, TEXT, center=True)
++            else:
++                icon(surf, "speaker", r.left + 38 * u, r.centery, 16 * u, GREEN if on else TEXT)
++                self.text(surf, "Stop" if on else "Read aloud", r.left + 66 * u, r.centery - 11 * u, 18, TEXT)
++
++    # ---------------------------------------------------------------- input
++    def on_down(self, pos):
++        self.drag, self.dstart, self.moved = pos, pos, 0.0
++
++    def on_move(self, pos):
++        if self.drag is None:
++            return
++        dy = pos[1] - self.drag[1]
++        self.moved += abs(dy)
++        self.drag = pos
++        self.scroll -= dy
++
++    def on_up(self, pos):
++        if self.drag is None:
++            return
++        start, self.drag = self.dstart, None
++        for n, r in self._bar().items():
++            if inside(pos, r) and inside(start, r):
++                self._press(n)
++                return
++
++    def _press(self, n):
++        if n in ("smaller", "bigger"):
++            self.scale = clamp(self.scale + (0.15 if n == "bigger" else -0.15), 0.7, 2.0)
++            self._wrap_cache = None
++        elif n == "top":
++            self.scroll = 0.0
++        elif n == "read":
++            self.stop_reading() if self.reading else self.start_reading()
++
++    # ---------------------------------------------------------------- read aloud
++    def start_reading(self):
++        text = "\n".join(t for t, _ in self.src)
++        self.chunks = speech_chunks(text, self.app.cfg.PDF_READ_CHARS)
++        self.reading = bool(self.chunks)
++        if not self.chunks:
++            self.app.speaker.say("This file has no text I can read.")
++
++    def stop_reading(self):
++        if self.reading:
++            self.reading, self.chunks = False, []
++            self.app.speaker.stop_now()
++
++    def tick(self, dt):
++        if not self.reading:
++            return
++        sp = self.app.speaker
++        if sp.busy():
++            return
++        if self.chunks:
++            sp.say(self.chunks.pop(0))
++        else:
++            self.reading = False
++            sp.say("That is the end of the file.")
++
++    def context(self):
++        return "A text viewer showing '%s'." % self.title
++
++    def comment(self):
++        return "Say, Luna, read aloud, and I will read this file to you."
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/ui.py luna/buddy/ui.py
+--- desk_buddy/buddy/ui.py	2026-11-15 16:51:26.000000000 +0000
++++ luna/buddy/ui.py	2026-11-18 20:32:38.398621108 +0000
+@@ -233,7 +233,26 @@
+         pygame.draw.line(surf, col, (cx - s * 0.15, cy - s * 0.45), (cx - s * 0.15, cy + s * 0.15), max(2, int(s * 0.12)))
+ 
+ 
+-ICONS = {"folder": ic_folder, "file": ic_file, "pdf": ic_pdf, "usb": ic_usb, "book": ic_book, "speaker": ic_speaker, "menu": ic_menu, "gear": ic_gear, "music": ic_music, "film": ic_film, "chart": ic_chart, "camera": ic_camera, "pencil": ic_pencil,
++def ic_calendar(surf, cx, cy, s, col):
++    pygame.draw.rect(surf, col, pygame.Rect(int(cx - s), int(cy - s * 0.8), int(2 * s), int(1.8 * s)), width=max(3, int(s * 0.14)), border_radius=int(s * 0.2))
++    pygame.draw.rect(surf, col, pygame.Rect(int(cx - s), int(cy - s * 0.8), int(2 * s), int(s * 0.5)), border_top_left_radius=int(s * 0.2), border_top_right_radius=int(s * 0.2))
++    for k in (-1, 1):
++        pygame.draw.line(surf, col, (cx + k * s * 0.5, cy - s * 1.0), (cx + k * s * 0.5, cy - s * 0.6), max(3, int(s * 0.14)))
++    for r in range(2):
++        for c in range(3):
++            pygame.draw.rect(surf, col, pygame.Rect(int(cx - s * 0.7 + c * s * 0.5), int(cy - s * 0.05 + r * s * 0.45), int(s * 0.3), int(s * 0.28)), border_radius=2)
++
++
++def ic_control(surf, cx, cy, s, col):
++    """Wall switch + ESP32 chip: a rocker switch plate with Wi-Fi arcs."""
++    pygame.draw.rect(surf, col, pygame.Rect(int(cx - s * 0.55), int(cy - s * 0.2), int(s * 1.1), int(s * 1.25)), width=max(3, int(s * 0.14)), border_radius=int(s * 0.18))
++    pygame.draw.rect(surf, col, pygame.Rect(int(cx - s * 0.25), int(cy + s * 0.05), int(s * 0.5), int(s * 0.55)), border_radius=int(s * 0.1))
++    for r in (0.45, 0.85):
++        pts = [(cx + math.cos(math.radians(a)) * s * r, cy - s * 0.35 - math.sin(math.radians(a)) * s * r) for a in range(40, 141, 10)]
++        _lines(surf, col, pts, s * 0.14)
++
++
++ICONS = {"calendar": ic_calendar, "control": ic_control, "folder": ic_folder, "file": ic_file, "pdf": ic_pdf, "usb": ic_usb, "book": ic_book, "speaker": ic_speaker, "menu": ic_menu, "gear": ic_gear, "music": ic_music, "film": ic_film, "chart": ic_chart, "camera": ic_camera, "pencil": ic_pencil,
+          "info": ic_info, "wifi": ic_wifi, "bluetooth": ic_bluetooth, "sun": ic_sun, "power": ic_power, "shield": ic_shield, "plus": ic_plus,
+          "play": ic_play, "pause": ic_pause, "check": ic_check, "user": ic_user, "shuffle": ic_shuffle, "eraser": ic_eraser, "save": ic_save,
+          "video": ic_video, "refresh": ic_refresh, "gallery": icon_gallery, "lock": icon_lock, "trash": icon_trash, "x": icon_x}
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/uiapps.py luna/buddy/uiapps.py
+--- desk_buddy/buddy/uiapps.py	2026-11-15 21:11:40.000000000 +0000
++++ luna/buddy/uiapps.py	2026-11-18 20:32:38.399023838 +0000
+@@ -23,19 +23,19 @@
+     TILES = [("Settings", "gear", (150, 160, 190), "settings"), ("Gallery", "gallery", BLUE, "gallery"), ("Music", "music", (255, 120, 170), "music"),
+              ("Movies", "film", (255, 160, 70), "movies"), ("Documents", "book", (255, 110, 100), "documents"),
+              ("Room Analysis", "chart", GREEN, "analysis"), ("Camera", "camera", (120, 210, 255), "camera"),
+-             ("Drawing", "pencil", (190, 130, 255), "drawing"), ("USB Drive", "usb", (110, 200, 255), "usb")]
++             ("Drawing", "pencil", (190, 130, 255), "drawing"), ("USB Drive", "usb", (110, 200, 255), "usb"),
++             ("Calendar", "calendar", (255, 150, 100), "calendar"), ("Control Center", "control", (80, 210, 190), "control")]
++    COLS = 6
+ 
+     def _tiles(self):
+         u, w = self.u, self.w
+-        cols, gap = 5, 14 * u
+-        tw = (w - 2 * 30 * u - (cols - 1) * gap) / cols
++        cols, gap = self.COLS, 12 * u
++        tw = (w - 2 * 24 * u - (cols - 1) * gap) / cols
+         th = 190 * u
+         out = []
+         for i, t in enumerate(self.TILES):
+             r, c = divmod(i, cols)
+-            n = len(self.TILES) - cols if r == 1 else cols
+-            x0 = 30 * u
+-            out.append((t, pygame.Rect(int(x0 + c * (tw + gap)), int(112 * u + r * (th + gap)), int(tw), int(th))))
++            out.append((t, pygame.Rect(int(24 * u + c * (tw + gap)), int(104 * u + r * (th + gap)), int(tw), int(th))))
+         return out
+ 
+     def draw(self, surf):
+@@ -45,8 +45,11 @@
+         for (label, ic, col, target), r in self._tiles():
+             pygame.draw.rect(surf, mix(CARD, col, 0.16), r, border_radius=int(22 * u))
+             pygame.draw.rect(surf, mix(CARD, col, 0.6), r, width=2, border_radius=int(22 * u))
++            if target == "usb" and getattr(self.app, "usb_present", False):
++                pygame.draw.rect(surf, GREEN, r.inflate(6 * u, 6 * u), width=4, border_radius=int(24 * u))      # lit up: a drive is plugged in
++                col = GREEN
+             icon(surf, ic, r.centerx, r.centery - 22 * u, 38 * u, col)
+-            self.text(surf, label, r.centerx, r.bottom - 48 * u, 20, TEXT, center=True)
++            self.text(surf, label, r.centerx, r.bottom - 48 * u, 17 if len(label) > 11 else 20, TEXT, center=True)
+ 
+     def on_up(self, pos):
+         for (label, ic, col, target), r in self._tiles():
+@@ -54,7 +57,7 @@
+                 self.app.open_app(target)
+ 
+     def context(self):
+-        return "The main menu with Settings, Gallery, Music, Movies, Documents, Room Analysis, Camera, Drawing and USB Drive."
++        return "The main menu with Settings, Gallery, Music, Movies, Documents, Room Analysis, Camera, Drawing, USB Drive, Calendar and Control Center."
+ 
+     def comment(self):
+         return "You can open the gallery, listen to music, watch movies or draw something. What would you like to do?"
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/usbmon.py luna/buddy/usbmon.py
+--- desk_buddy/buddy/usbmon.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/usbmon.py	2026-11-18 20:29:30.681893414 +0000
+@@ -0,0 +1,123 @@
++"""USB pen-drive monitor + safe eject.
++
++A small polling daemon (pyudev is used as a wake-up trigger when it is installed, but is NOT required) watches
++/media/$USER/, /media/, /run/media/$USER/ and the patterns in config.USB_ROOTS. It posts ("usb", ("in", drive))
++and ("usb", ("out", path)) events into the app's event queue, so the UI thread does all the drawing.
++"""
++import getpass
++import glob
++import logging
++import os
++import shutil
++import subprocess
++import threading
++import time
++
++log = logging.getLogger("usbmon")
++
++
++def roots(cfg):
++    user = getpass.getuser()
++    pats = ["/media/%s/*" % user, "/run/media/%s/*" % user, "/media/*"] + list(cfg.USB_ROOTS)
++    seen, out = set(), []
++    for p in pats:
++        if p not in seen:
++            seen.add(p)
++            out.append(p)
++    return out
++
++
++def scan(cfg):
++    """-> {path: dict(label, path, free, total)} for every mounted removable volume."""
++    found = {}
++    for pat in roots(cfg):
++        for p in sorted(glob.glob(pat)):
++            if p in found or not os.path.isdir(p):
++                continue
++            if cfg.USB_REQUIRE_MOUNT and not os.path.ismount(p):
++                continue
++            if p.rstrip("/") in ("/media", "/run/media", "/mnt", "/media/" + getpass.getuser()):
++                continue
++            try:
++                du = shutil.disk_usage(p)
++                free, total = du.free, du.total
++            except OSError:
++                continue
++            found[p] = dict(label=os.path.basename(p), path=p, free=free, total=total)
++    return found
++
++
++class USBMonitor(threading.Thread):
++    def __init__(self, cfg, events, simulate=False):
++        super().__init__(daemon=True, name="usbmon")
++        self.cfg, self.events, self.sim = cfg, events, simulate
++        self.drives = {}
++        self.present = False
++        self.running = True
++        self._wake = threading.Event()
++
++    def run(self):
++        self.drives = scan(self.cfg)
++        self.present = bool(self.drives)
++        self._try_udev()
++        while self.running:
++            self._wake.wait(self.cfg.USB_POLL_S)
++            self._wake.clear()
++            try:
++                cur = scan(self.cfg)
++            except Exception:
++                log.exception("scan failed")
++                continue
++            for p, d in cur.items():
++                if p not in self.drives:
++                    log.info("USB in: %s", p)
++                    self.events.put(("usb", ("in", d)))
++            for p in self.drives:
++                if p not in cur:
++                    log.info("USB out: %s", p)
++                    self.events.put(("usb", ("out", p)))
++            self.drives = cur
++            self.present = bool(cur)
++
++    def _try_udev(self):
++        """Optional: wake the poller instantly on a block-device event (pip install pyudev)."""
++        try:
++            import pyudev
++            ctx = pyudev.Context()
++            mon = pyudev.Monitor.from_netlink(ctx)
++            mon.filter_by("block")
++            obs = pyudev.MonitorObserver(mon, callback=lambda dev: (time.sleep(1.5), self._wake.set()))
++            obs.daemon = True
++            obs.start()
++            log.info("pyudev trigger enabled")
++        except Exception:
++            pass
++
++    def stop(self):
++        self.running = False
++        self._wake.set()
++
++
++def safe_eject(path):
++    """Flush buffers (sync), unmount cleanly, power the stick off. -> (ok, message)."""
++    try:
++        os.sync()
++        subprocess.run(["sync", "-f", path], capture_output=True, timeout=60)
++    except Exception as e:
++        log.info("sync: %s", e)
++    try:
++        src = subprocess.run(["findmnt", "-n", "-o", "SOURCE", path], capture_output=True, text=True, timeout=5).stdout.strip()
++        ok = False
++        if src:
++            r = subprocess.run(["udisksctl", "unmount", "-b", src], capture_output=True, text=True, timeout=30)
++            ok = r.returncode == 0
++            if ok:
++                subprocess.run(["udisksctl", "power-off", "-b", src.rstrip("0123456789")], capture_output=True, timeout=15)
++            elif "busy" in (r.stderr or "").lower():
++                return False, "Drive is busy - close the file that is open on it"
++        if not ok:
++            ok = subprocess.run(["umount", path], capture_output=True, timeout=30).returncode == 0
++        return (True, "You can remove the USB drive now") if ok else (False, "Could not eject - is a file still open?")
++    except Exception as e:
++        log.info("eject failed: %s", e)
++        return False, "Eject failed"
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/util.py luna/buddy/util.py
+--- desk_buddy/buddy/util.py	2026-11-15 00:32:53.000000000 +0000
++++ luna/buddy/util.py	2026-11-18 20:28:36.949669016 +0000
+@@ -92,3 +92,40 @@
+             json.dump(d, f)
+     except Exception:
+         pass
++
++
++# ---------------------------------------------------------------- error boundary
++import functools as _ft
++
++_elog = logging.getLogger("errors")
++
++
++def guarded(label="", default=None, say=True):
++    """Decorator: never let an exception escape a UI handler. The traceback goes to logs/buddy.log
++    and the person sees a small toast. The main event loop keeps running."""
++    def deco(fn):
++        @_ft.wraps(fn)
++        def wrapper(self, *a, **k):
++            try:
++                return fn(self, *a, **k)
++            except Exception:
++                _elog.exception("handler %s.%s failed", type(self).__name__, label or fn.__name__)
++                app = getattr(self, "app", None)
++                if say and app is not None:
++                    try:
++                        app.toast("Something went wrong - details are in logs/buddy.log", 3.5)
++                    except Exception:
++                        pass
++                return default
++        return wrapper
++    return deco
++
++
++def harden(cls, names, default=None):
++    """Wrap the named methods of a screen class with `guarded`."""
++    for n in names:
++        fn = getattr(cls, n, None)
++        if fn is not None and not getattr(fn, "_hardened", False):
++            w = guarded(n, default)(fn)
++            w._hardened = True
++            setattr(cls, n, w)
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/buddy/vault.py luna/buddy/vault.py
+--- desk_buddy/buddy/vault.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/buddy/vault.py	2026-11-18 20:29:04.131079227 +0000
+@@ -0,0 +1,319 @@
++"""Secure hidden vault: VaultManager (logic) + VaultScreen (on-screen PIN / password modal).
++
++Why this file exists
++--------------------
++Bug: tapping the padlock in the gallery called ``App.request_hidden(replace=False)`` but the method took no
++argument -> TypeError -> the exception escaped the main loop -> Luna closed and you landed on Raspberry Pi OS.
++
++Fixes
++-----
++* ``App.request_hidden`` now accepts ``replace`` (and every gallery / file handler is wrapped by ``guarded``).
++* The main loop catches every per-frame exception, logs it to logs/buddy.log and keeps running.
++* ``VaultManager`` is the ONLY door to data/hidden/: it hands out the file list only while a PBKDF2-verified
++  session is open. Failed tries are counted on disk, so a reboot does not reset the lockout.
++* Cancel / wrong PIN / lockout always end with ``on_done("cancel" | "failed" | "locked")`` and the app returns to
++  the normal gallery - never to the OS.
++
++The hash file is data/hidden_pin.json, the same file the old PinStore used, so your existing PIN keeps working.
++"""
++import json
++import logging
++import math
++import os
++import stat
++import time
++
++import pygame
++
++from .face import font
++from .screens import BG, BLUE, CARD, MUTED, PURPLE, RED, TEXT, TRACK, button, icon_arrow, icon_lock, icon_x, inside
++from .ui import Screen
++from .util import guarded, mix
++
++log = logging.getLogger("vault")
++
++PIN_LEN = 4
++
++
++class VaultManager:
++    """Verifies the secret (4-digit PIN or an alphanumeric password) and guards access to data/hidden/."""
++
++    def __init__(self, cfg, pins):
++        self.cfg, self.pins = cfg, pins            # pins = gallery.PinStore (salted PBKDF2-SHA256, 150 000 rounds)
++        self._until = 0.0                          # session expiry (monotonic-ish wall clock)
++        self._state = self._load()
++        self.mount()
++
++    # ------------------------------------------------------------ persistence of lockout state
++    def _load(self):
++        try:
++            with open(self.cfg.VAULT_STATE_FILE) as f:
++                d = json.load(f)
++            return dict(fails=int(d.get("fails", 0)), locked_until=float(d.get("locked_until", 0)), rounds=int(d.get("rounds", 0)))
++        except Exception:
++            return dict(fails=0, locked_until=0.0, rounds=0)
++
++    def _save(self):
++        try:
++            os.makedirs(os.path.dirname(self.cfg.VAULT_STATE_FILE), exist_ok=True)
++            with open(self.cfg.VAULT_STATE_FILE, "w") as f:
++                json.dump(self._state, f)
++            os.chmod(self.cfg.VAULT_STATE_FILE, 0o600)
++        except Exception as e:
++            log.warning("cannot save vault state: %s", e)
++
++    # ------------------------------------------------------------ "mounting" the hidden folder
++    def mount(self):
++        """Make sure data/hidden/ exists and is private to this user (chmod 700)."""
++        try:
++            os.makedirs(self.cfg.HIDDEN_DIR, exist_ok=True)
++            os.chmod(self.cfg.HIDDEN_DIR, stat.S_IRWXU)
++        except Exception as e:
++            log.warning("vault mount: %s", e)
++
++    # ------------------------------------------------------------ credentials
++    def is_set(self):
++        return self.pins.is_set()
++
++    def set_secret(self, secret):
++        if not secret or (len(secret) < PIN_LEN):
++            return False
++        self.pins.set(secret)
++        self._state.update(fails=0, locked_until=0.0, rounds=0)
++        self._save()
++        return True
++
++    def seconds_locked(self):
++        return max(0.0, self._state["locked_until"] - time.time())
++
++    def verify(self, secret):
++        """-> 'ok' | 'bad' | 'locked'. Three wrong tries lock for 30 s, doubling each round (kept on disk)."""
++        if self.seconds_locked() > 0:
++            return "locked"
++        if secret and self.pins.verify(secret):
++            self._state.update(fails=0, locked_until=0.0, rounds=0)
++            self._save()
++            self.unlock()
++            return "ok"
++        self._state["fails"] += 1
++        if self._state["fails"] >= self.cfg.VAULT_MAX_TRIES:
++            self._state["locked_until"] = time.time() + self.cfg.VAULT_LOCK_BASE_S * (2 ** self._state["rounds"])
++            self._state["rounds"] += 1
++            self._state["fails"] = 0
++            log.warning("vault: too many wrong tries, locked for %ds", self.seconds_locked())
++        self._save()
++        return "bad" if self.seconds_locked() <= 0 else "locked"
++
++    # ------------------------------------------------------------ session
++    def unlock(self):
++        self._until = time.time() + self.cfg.HIDDEN_IDLE_S
++
++    def touch(self):
++        if self.is_unlocked():
++            self._until = time.time() + self.cfg.HIDDEN_IDLE_S
++
++    def lock(self):
++        self._until = 0.0
++
++    def is_unlocked(self):
++        return time.time() < self._until
++
++    # ------------------------------------------------------------ the only way to see the hidden files
++    def list_files(self):
++        if not self.is_unlocked():
++            return []
++        from .gallery import EXTS
++        d = self.cfg.HIDDEN_DIR
++        try:
++            fs = [os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(EXTS)]
++        except OSError:
++            return []
++        return sorted(fs, key=os.path.getmtime, reverse=True)
++
++
++# =============================================================================== modal screen
++class VaultScreen(Screen):
++    """Full-screen modal. Modes: unlock | setup. Keypad for a 4-digit PIN; 'Use password' opens the keyboard instead."""
++    name, title, accent = "vault", "Hidden vault", PURPLE
++    mini = False
++
++    def __init__(self, app):
++        super().__init__(app)
++        self.mode, self.stage, self.buf, self.first, self.msg = "unlock", "enter", "", "", ""
++        self.on_done = None
++        self.pressed = ("", 0.0)
++        self.shake_t = 0.0
++
++    def enter(self, mode="unlock", on_done=None, **kw):
++        self.mode, self.on_done = mode, on_done
++        self.stage = "enter" if mode == "unlock" else "new"
++        self.buf, self.first, self.msg = "", "", ""
++        self.app.vault.mount()
++
++    # ---- layout
++    def _keys(self):
++        u = self.u
++        kw, kh, gap = 104 * u, 62 * u, 12 * u
++        x0, y0 = self.w / 2 - (3 * kw + 2 * gap) / 2, 232 * u
++        labels = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "X", "0", "<"]
++        return {lab: pygame.Rect(int(x0 + (i % 3) * (kw + gap)), int(y0 + (i // 3) * (kh + gap)), int(kw), int(kh)) for i, lab in enumerate(labels)}
++
++    def _pw_rect(self):
++        u = self.u
++        return pygame.Rect(int(self.w - 250 * u), int(self.h - 84 * u), int(230 * u), int(56 * u))
++
++    def priority_hit(self, pos):
++        return False
++
++    def _heading(self):
++        if self.mode == "unlock":
++            return "Enter PIN"
++        return "Create a 4-digit PIN" if self.stage == "new" else "Confirm your PIN"
++
++    # ---- drawing
++    @guarded("draw")
++    def draw(self, surf):
++        u, w = self.u, self.w
++        surf.fill(mix(BG, PURPLE, 0.12))
++        icon_lock(surf, w / 2, 56 * u, 26 * u, PURPLE)
++        t = font(30 * u).render(self._heading(), True, TEXT)
++        surf.blit(t, (w / 2 - t.get_width() / 2, 98 * u))
++        now = time.time()
++        off = math.sin(now * 60) * 12 * u if now < self.shake_t else 0
++        for i in range(PIN_LEN):
++            c = (int(w / 2 + (i - (PIN_LEN - 1) / 2.0) * 54 * u + off), int(176 * u))
++            pygame.draw.circle(surf, PURPLE if i < len(self.buf) else TRACK, c, int(15 * u))
++            if i >= len(self.buf):
++                pygame.draw.circle(surf, mix(BG, PURPLE, 0.3), c, int(15 * u), 2)
++        lock_s = self.app.vault.seconds_locked()
++        if lock_s > 0:
++            msg, col = "Too many tries. Wait %ds" % math.ceil(lock_s), RED
++        else:
++            msg, col = (self.msg or "Type the PIN on the keypad"), (RED if self.msg else MUTED)
++        m = font(20 * u).render(msg, True, col)
++        surf.blit(m, (w / 2 - m.get_width() / 2, 202 * u))
++        for lab, r in self._keys().items():
++            hot = self.pressed[0] == lab and now - self.pressed[1] < 0.15
++            button(surf, r, PURPLE if lab not in ("X", "<") else MUTED, mix(CARD, PURPLE, 0.5) if hot else None)
++            if lab == "X":
++                icon_x(surf, r.centerx, r.centery, 20 * u, MUTED)
++            elif lab == "<":
++                icon_arrow(surf, r.centerx, r.centery, 20 * u, MUTED, True)
++            else:
++                n = font(34 * u).render(lab, True, TEXT)
++                surf.blit(n, (r.centerx - n.get_width() / 2, r.centery - n.get_height() / 2))
++        r = self._pw_rect()
++        button(surf, r, BLUE)
++        self.text(surf, "Use password", r.centerx, r.centery - 11 * u, 20, TEXT, center=True)
++        b = self.back_rect()
++        button(surf, b, TEXT)
++        icon_arrow(surf, b.centerx, b.centery, 18 * u, TEXT, True)
++
++    # ---- input
++    def on_back(self):
++        self._finish("cancel")
++
++    def _finish(self, res):
++        cb = self.on_done
++        self.on_done = None
++        self.app.back()
++        if cb:
++            try:
++                cb(res)
++            except Exception:
++                log.exception("vault callback failed")
++
++    @guarded("on_down")
++    def on_down(self, pos):
++        v = self.app.vault
++        if inside(pos, self._pw_rect()):
++            self._password_flow()
++            return
++        now = time.time()
++        for lab, r in self._keys().items():
++            if not inside(pos, r):
++                continue
++            self.pressed = (lab, now)
++            if v.seconds_locked() > 0 and self.mode == "unlock":
++                return
++            if lab == "X":
++                self._finish("cancel")
++            elif lab == "<":
++                self.buf = self.buf[:-1]
++            else:
++                if len(self.buf) < PIN_LEN:
++                    self.buf += lab
++                if len(self.buf) == PIN_LEN:
++                    self._submit(self.buf)
++            return
++
++    def _submit(self, secret):
++        v = self.app.vault
++        if self.mode == "unlock":
++            res = v.verify(secret)
++            if res == "ok":
++                self._finish("unlocked")
++                return
++            self.buf = ""
++            self.shake_t = time.time() + 0.4
++            self.msg = "Wrong PIN" if res == "bad" else ""
++            if res == "locked":
++                self.app.toast("Vault locked for %d seconds" % math.ceil(v.seconds_locked()), 3)
++            return
++        if self.stage == "new":
++            self.first, self.buf, self.stage, self.msg = secret, "", "confirm", ""
++        elif secret != self.first:
++            self.buf, self.stage, self.first, self.msg = "", "new", "", "PINs did not match - start again"
++            self.shake_t = time.time() + 0.4
++        else:
++            v.set_secret(secret)
++            v.unlock()
++            self._finish("pin_set")
++
++    # ---- alphanumeric password through the on-screen keyboard
++    def _password_flow(self):
++        a, v = self.app, self.app.vault
++        cb = self.on_done
++        self.on_done = None
++        if self.mode == "unlock":
++            def got(text):
++                if text is None:
++                    self.on_done = cb
++                    return
++                res = v.verify(text)
++                if res == "ok":
++                    if cb:
++                        cb("unlocked")
++                else:
++                    a.toast("Wrong password" if res == "bad" else "Too many tries - wait %ds" % math.ceil(v.seconds_locked()), 3)
++                    if cb:
++                        cb("failed" if res == "bad" else "locked")
++            a.back()
++            a.ask_text("Vault password", "", got, password=True, hint="letters and numbers")
++        else:
++            def first(text):
++                if not text:
++                    if cb:
++                        cb("cancel")
++                    return
++                if len(text) < PIN_LEN:
++                    a.toast("Use at least 4 characters", 3)
++                    if cb:
++                        cb("cancel")
++                    return
++
++                def second(t2):
++                    if t2 == text and v.set_secret(text):
++                        v.unlock()
++                        if cb:
++                            cb("pin_set")
++                    else:
++                        a.toast("Passwords did not match", 3)
++                        if cb:
++                            cb("cancel")
++                a.ask_text("Confirm password", "", second, password=True)
++            a.back()
++            a.ask_text("Create a vault password", "", first, password=True, hint="at least 4 characters")
++
++    def context(self):
++        return "A secure keypad for the hidden vault is on the screen. I never look at or say the PIN."
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/config.py luna/config.py
+--- desk_buddy/config.py	2026-11-15 16:51:03.000000000 +0000
++++ luna/config.py	2026-11-18 20:28:36.949564332 +0000
+@@ -110,6 +110,9 @@
+     "control": 3,          # volume, timers, sleep / wake
+     "introduce": 4,        # introduce someone (they become 'least priority')
+     "chat": 4,             # questions, sensors, jokes, room analysis
++    "switches": 3,         # turn the ESP32 servo switches on / off
++    "calendar": 3,         # open / edit the calendar
++    "control_center": 1,   # open the Control Center app (add / remove ESP32 nodes)
+ }
+ 
+ # ----------------------------------------------------------- photos / gallery
+@@ -144,7 +147,7 @@
+ 
+ # ------------------------------------------------------- USB drives / documents
+ PDF_DIR = os.path.join(DATA_DIR, "pdfs")          # put PDFs here (or open them straight from a USB drive)
+-USB_ROOTS = ["/media/*/*", "/run/media/*/*", "/mnt/*"]   # where the desktop mounts pen drives
++USB_ROOTS = ["/media/*/*", "/media/*", "/run/media/*/*", "/mnt/*"]   # where the desktop mounts pen drives
+ USB_REQUIRE_MOUNT = True
+ PDF_BASE_DPI_MAX = 130
+ PDF_READ_CHARS = 320             # size of each spoken chunk when reading a PDF aloud
+@@ -167,6 +170,43 @@
+ LONGITUDE = 77.59                # no BMP280 is fitted. Change to your location.
+ PRESSURE_REFRESH_S = 900
+ 
++
++# =====================================================================
++# v2 additions: vault, USB, calendar, ESP32 control center, Telegram bot
++# =====================================================================
++# ---- hidden vault
++VAULT_STATE_FILE = os.path.join(DATA_DIR, "vault_state.json")   # failed-try counter + lockout (survives restarts)
++VAULT_MAX_TRIES = 3              # wrong tries before the first lockout
++VAULT_LOCK_BASE_S = 30           # first lockout 30 s, doubles every time
++
++# ---- USB pen drive
++USB_POLL_S = 2.0                 # how often Luna looks for new drives
++MPV_HWDEC = "auto"               # mpv hardware decoding (try "v4l2m2m-copy" if video stutters)
++MPV_EXTRA = []                   # extra mpv flags, e.g. ["--vo=gpu"]
++TEXT_EXTS = (".txt", ".md")
++
++# ---- calendar
++CALENDAR_FILE = os.path.join(DATA_DIR, "calendar.json")
++CALENDAR_STATE_FILE = os.path.join(DATA_DIR, "calendar_state.json")
++CALENDAR_REMIND_HOUR = 9         # day-prior reminder time (24 h clock)
++CALENDAR_REMIND_MINUTE = 0
++CALENDAR_CATCHUP_UNTIL_HOUR = 21 # if Luna was off at 09:00, still remind until this hour
++
++# ---- ESP32 control center
++ESP32_FILE = os.path.join(DATA_DIR, "esp32.json")
++ESP32_MDNS_NAME = "esp32-switch.local"
++ESP32_API_KEY = ""               # same value as API_KEY in the ESP32 firmware (leave "" to disable)
++ESP32_TIMEOUT_S = 4
++ESP32_POLL_S = 15
++ESP32_DEFAULT_ANGLE = 45         # flick distance from neutral, degrees
++ESP32_LOG_FILE = os.path.join(DATA_DIR, "switch_log.jsonl")
++
++# ---- Telegram bot (token + chat id are set in Settings > Security > Telegram alerts)
++TELEGRAM_BOT_ENABLED = True
++TELEGRAM_POLL_TIMEOUT_S = 25
++TELEGRAM_MAX_FILE_MB = 20        # Bot API download limit
++GAS_ALERT_REPEAT_S = 300         # repeat the gas alert every 5 minutes while it lasts
++
+ try:
+     from config_local import *   # noqa: F401,F403
+ except ImportError:
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/data/calendar.json luna/data/calendar.json
+--- desk_buddy/data/calendar.json	1970-01-01 00:00:00.000000000 +0000
++++ luna/data/calendar.json	2026-11-19 01:27:02.872948781 +0000
+@@ -0,0 +1 @@
++{"events": []}
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/data/esp32.json luna/data/esp32.json
+--- desk_buddy/data/esp32.json	1970-01-01 00:00:00.000000000 +0000
++++ luna/data/esp32.json	2026-11-19 01:27:02.872948781 +0000
+@@ -0,0 +1 @@
++{"nodes": []}
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/requirements.txt luna/requirements.txt
+--- desk_buddy/requirements.txt	2026-11-12 23:08:36.000000000 +0000
++++ luna/requirements.txt	2026-11-19 01:26:57.874398333 +0000
+@@ -8,3 +8,5 @@
+ vosk
+ gTTS
+ requests
++zeroconf
++pyudev
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/scripts/install.sh luna/scripts/install.sh
+--- desk_buddy/scripts/install.sh	2026-11-15 21:11:40.000000000 +0000
++++ luna/scripts/install.sh	2026-11-19 01:26:57.874054247 +0000
+@@ -9,7 +9,8 @@
+ sudo apt install -y python3-venv python3-pip python3-dev python3-pygame python3-numpy \
+     python3-gpiozero python3-lgpio python3-smbus libportaudio2 portaudio19-dev \
+     espeak-ng mpg123 pulseaudio-utils bluez fonts-dejavu-core unzip wget i2c-tools \
+-    python3-opencv v4l-utils mpv brightnessctl network-manager poppler-utils udisks2 exfatprogs ntfs-3g
++    python3-opencv v4l-utils mpv brightnessctl network-manager poppler-utils udisks2 exfatprogs ntfs-3g \
++    avahi-daemon avahi-utils libnss-mdns
+ sudo apt install -y libgpiod3 2>/dev/null || sudo apt install -y libgpiod2 || true
+ 
+ echo "==> Enabling I2C, desktop auto-login, no screen blanking"
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/tools/test_esp32.py luna/tools/test_esp32.py
+--- desk_buddy/tools/test_esp32.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/tools/test_esp32.py	2026-11-19 01:26:57.877859352 +0000
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""Talk to an ESP32 switch node from the command line (no Luna needed).
++   ./venv/bin/python tools/test_esp32.py esp32-switch.local            -> info + status
++   ./venv/bin/python tools/test_esp32.py esp32-switch.local 0 on        -> flick servo 0 ON
++   ./venv/bin/python tools/test_esp32.py esp32-switch.local 0 off 60    -> flick OFF with a 60 degree push
++"""
++import os, sys
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import config as cfg
++from buddy.control_center import Esp32Api
++
++host = sys.argv[1] if len(sys.argv) > 1 else cfg.ESP32_MDNS_NAME
++api = Esp32Api(cfg)
++node = dict(id="cli", host=host, port=80)
++print("resolve :", api.resolve(host))
++print("info    :", api.info(node))
++print("status  :", api.status(node))
++if len(sys.argv) >= 4:
++    angle = int(sys.argv[4]) if len(sys.argv) > 4 else None
++    print("servo   :", api.servo(node, int(sys.argv[2]), sys.argv[3], angle))
+diff -ruN '--exclude=__pycache__' '--exclude=tests' '--exclude=firmware' desk_buddy/tools/test_telegram.py luna/tools/test_telegram.py
+--- desk_buddy/tools/test_telegram.py	1970-01-01 00:00:00.000000000 +0000
++++ luna/tools/test_telegram.py	2026-11-19 01:26:57.878636821 +0000
+@@ -0,0 +1,12 @@
++#!/usr/bin/env python3
++"""Check your Telegram bot token / chat id from the Pi:  ./venv/bin/python tools/test_telegram.py"""
++import json, os, sys
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import requests
++import config as cfg
++d = json.load(open(os.path.join(cfg.DATA_DIR, "telegram.json")))
++tok, chat = d.get("token") or d.get("bot_token"), d.get("chat_id")
++me = requests.get("https://api.telegram.org/bot%s/getMe" % tok, timeout=10).json()
++print("bot  :", me.get("result", {}).get("username"), "ok" if me.get("ok") else me)
++r = requests.post("https://api.telegram.org/bot%s/sendMessage" % tok, data={"chat_id": chat, "text": "Luna test message \u2705"}, timeout=10)
++print("send :", r.status_code, r.text[:120])

@@ -1,0 +1,12 @@
+# Installed into the project's virtual environment by scripts/install.sh
+# (pygame, gpiozero, lgpio and numpy come from apt via --system-site-packages)
+adafruit-blinka
+adafruit-circuitpython-dht
+adafruit-circuitpython-bmp280
+smbus2
+sounddevice
+vosk
+gTTS
+requests
+zeroconf
+pyudev

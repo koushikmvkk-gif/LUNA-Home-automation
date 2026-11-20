@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Local configuration and credentials
+config_local.py
+.env
+.env.*
+!.env.example
+
+# Runtime logs and downloaded models
+logs/*
+!logs/.keep
+models/*
+!models/.keep
+
+# Personal/runtime data (photos, PINs, events, Telegram credentials, devices)
+data/**/*.json
+data/gallery/
+data/hidden/
+data/faces/*
+!data/faces/.keep
+data/priority/*.json
+data/security/
+data/music/
+data/movies/
+data/pdfs/
+data/drawings/
+data/thumbs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
