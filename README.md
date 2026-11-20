@@ -1,7 +1,7 @@
 # Luna v2 — Desk Assistant Pet Robot
 
 <p align="center">
-  <img src="assets/screenshots/01-home-screen.png" alt="Luna v2 home screen" width="800">
+  <img src="01-home-screen.png" alt="Luna v2 home screen" width="800">
 </p>
 
 <p align="center">
@@ -100,7 +100,7 @@ The Raspberry Pi is the main processing unit. It handles the user interface, voi
 The ESP32 is a separate actuator node. It joins the same 2.4 GHz Wi-Fi network and exposes a small HTTP REST API. Luna sends commands to the ESP32; the ESP32 runs the servo movement locally.
 
 <p align="center">
-  <img src="assets/build-guide/software-system-architecture.png" alt="Luna v2 software and hardware architecture from the build guide" width="850">
+  <img src="software-system-architecture.png" alt="Luna v2 software and hardware architecture from the build guide" width="850">
 </p>
 
 ### 3.2 Main processing flow
@@ -217,7 +217,7 @@ The following table uses **physical pin numbers** on the Raspberry Pi 40-pin hea
 **Important — MQ-2 voltage divider:** The MQ-2 output may reach 5 V, while Raspberry Pi GPIO inputs are 3.3 V tolerant. Do not connect the sensor output directly to a Pi GPIO. Use the specified 10 kΩ series resistor and 20 kΩ resistor to GND, and take the signal from their junction. The software configuration assumes `MQ2_DIVIDER_RATIO = 1.5`.
 
 <p align="center">
-  <img src="assets/build-guide/raspberry-pi-sensor-wiring.png" alt="Raspberry Pi sensor wiring and pin table" width="850">
+  <img src="raspberry-pi-sensor-wiring.png" alt="Raspberry Pi sensor wiring and pin table" width="850">
 </p>
 
 Additional installation notes:
@@ -248,7 +248,7 @@ Servo wire connections:
 - Fit the 470 µF capacitor across servo supply 5 V and GND, close to the servos.
 
 <p align="center">
-  <img src="assets/build-guide/esp32-mg90-servo-wiring.png" alt="ESP32 to four MG90 servo wiring diagram" width="850">
+  <img src="esp32-mg90-servo-wiring.png" alt="ESP32 to four MG90 servo wiring diagram" width="850">
 </p>
 
 **Do not power MG90 servos from the ESP32 3.3 V pin or Raspberry Pi.** Use a separate servo supply. Insufficient current or a missing common ground can cause servo instability or ESP32 resets.
@@ -559,7 +559,7 @@ The following screenshots are taken from the supplied **Luna v2 Screens.pdf** an
 ### 11.1 Home screen
 
 <p align="center">
-  <img src="assets/screenshots/01-home-screen.png" alt="Luna robot home screen" width="800">
+  <img src="01-home-screen.png" alt="Luna robot home screen" width="800">
 </p>
 
 The home screen presents Luna's expressive face, USB connection indicator, temperature, humidity, time, and the prompt to say “Luna” or touch the pad.
@@ -567,7 +567,7 @@ The home screen presents Luna's expressive face, USB connection indicator, tempe
 ### 11.2 Main menu
 
 <p align="center">
-  <img src="assets/screenshots/02-main-menu.png" alt="Luna main menu" width="800">
+  <img src="02-main-menu.png" alt="Luna main menu" width="800">
 </p>
 
 The menu provides access to Gallery, Music, Movies, Documents, USB Drive, Calendar, Control Center, Security, Weather, Games, and Settings.
@@ -575,7 +575,7 @@ The menu provides access to Gallery, Music, Movies, Documents, USB Drive, Calend
 ### 11.3 Hidden gallery vault
 
 <p align="center">
-  <img src="assets/screenshots/03-hidden-gallery-vault.png" alt="Hidden gallery PIN screen" width="800">
+  <img src="03-hidden-gallery-vault.png" alt="Hidden gallery PIN screen" width="800">
 </p>
 
 The hidden gallery requests a PIN or password. The documented lockout is three incorrect attempts followed by a 30-second lock period, with subsequent lockouts increasing.
@@ -583,7 +583,7 @@ The hidden gallery requests a PIN or password. The documented lockout is three i
 ### 11.4 Gallery and Telegram media
 
 <p align="center">
-  <img src="assets/screenshots/04-gallery.png" alt="Luna gallery with media items" width="800">
+  <img src="04-gallery.png" alt="Luna gallery with media items" width="800">
 </p>
 
 The gallery displays local media and media received through Telegram.
@@ -591,7 +591,7 @@ The gallery displays local media and media received through Telegram.
 ### 11.5 USB file explorer
 
 <p align="center">
-  <img src="assets/screenshots/05-usb-file-explorer.png" alt="USB file explorer" width="800">
+  <img src="05-usb-file-explorer.png" alt="USB file explorer" width="800">
 </p>
 
 The explorer shows folders and supported files, including pictures, videos, PDFs, text files, and Markdown files. It also provides an eject action.
@@ -599,7 +599,7 @@ The explorer shows folders and supported files, including pictures, videos, PDFs
 ### 11.6 Text and Markdown reader
 
 <p align="center">
-  <img src="assets/screenshots/06-text-markdown-reader.png" alt="Markdown reader with text size and read aloud controls" width="800">
+  <img src="06-text-markdown-reader.png" alt="Markdown reader with text size and read aloud controls" width="800">
 </p>
 
 The text reader supports text-size controls and read-aloud functionality.
@@ -607,7 +607,7 @@ The text reader supports text-size controls and read-aloud functionality.
 ### 11.7 Calendar
 
 <p align="center">
-  <img src="assets/screenshots/07-calendar-month-view.png" alt="Luna monthly calendar" width="800">
+  <img src="07-calendar-month-view.png" alt="Luna monthly calendar" width="800">
 </p>
 
 The calendar uses different markers for birthdays, anniversaries, and custom events.
@@ -615,7 +615,7 @@ The calendar uses different markers for birthdays, anniversaries, and custom eve
 ### 11.8 Add event
 
 <p align="center">
-  <img src="assets/screenshots/08-calendar-add-event.png" alt="Calendar event creation screen" width="800">
+  <img src="08-calendar-add-event.png" alt="Calendar event creation screen" width="800">
 </p>
 
 Events can be associated with a person Luna knows or entered as a custom event. Recurrence can be yearly or limited to one day.
@@ -623,7 +623,7 @@ Events can be associated with a person Luna knows or entered as a custom event. 
 ### 11.9 Control Center — nodes
 
 <p align="center">
-  <img src="assets/screenshots/09-control-center-nodes.png" alt="Control Center ESP32 nodes" width="800">
+  <img src="09-control-center-nodes.png" alt="Control Center ESP32 nodes" width="800">
 </p>
 
 The Nodes view lists ESP32 controllers and their online/offline status, address, and servo count.
@@ -631,7 +631,7 @@ The Nodes view lists ESP32 controllers and their online/offline status, address,
 ### 11.10 Control Center — switchboard
 
 <p align="center">
-  <img src="assets/screenshots/10-control-center-switchboard.png" alt="Control Center switchboard" width="800">
+  <img src="10-control-center-switchboard.png" alt="Control Center switchboard" width="800">
 </p>
 
 The Switchboard displays individual switches and their logical ON/OFF state.
@@ -639,7 +639,7 @@ The Switchboard displays individual switches and their logical ON/OFF state.
 ### 11.11 Security guard mode
 
 <p align="center">
-  <img src="assets/screenshots/11-security-guard-mode.png" alt="Luna security guard mode" width="800">
+  <img src="11-security-guard-mode.png" alt="Luna security guard mode" width="800">
 </p>
 
 Guard mode changes the interface to a security state and uses the camera/intrusion workflow.
@@ -647,7 +647,7 @@ Guard mode changes the interface to a security state and uses the camera/intrusi
 ### 11.12 Telegram alerts
 
 <p align="center">
-  <img src="assets/screenshots/12-telegram-alerts.png" alt="Telegram alerts configuration and example messages" width="800">
+  <img src="12-telegram-alerts.png" alt="Telegram alerts configuration and example messages" width="800">
 </p>
 
 The Telegram settings screen accepts the bot token and chat ID and displays example status and alert messages.
