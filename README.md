@@ -56,3 +56,6 @@ Settings live in `config.py`; put your own overrides in `config_local.py`.
 * Menu tiles **Documents** (`data/pdfs/`) and **USB Drive**. Plug a pen drive in and Luna announces it; browse it, open PDFs / pictures / songs / videos straight from it, hold a file to copy it to Luna, **Backup to USB**, **Eject**.
 * **PDF reader** (poppler): swipe pages, zoom, jump to a page, remembers where you stopped. Voice: "Luna, read PDF <name>", "read this page" (she reads aloud and turns pages), "stop reading", "next page", "go to page 5", "zoom in".
 * Needs `poppler-utils` (installed by `scripts/install.sh`).
+
+## Screens
+Preview the v2 interface in the [screen gallery](docs/screens/README.md). It includes the source PDF and individual PNGs for each screen.
